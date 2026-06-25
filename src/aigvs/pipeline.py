@@ -204,7 +204,7 @@ class AIGVSPipeline:
         X = np.array(embeddings, dtype=np.float32)  # (N, D)
         N = len(chunks)
         print(f"[AIGVS] Converted dicts to chunks. N={N}", flush=True)
-
+        
         # small corpus: skip macro discovery and insert directly
         num_leaves_est = N / self.root.max_leaf_capacity
         if num_leaves_est < 4:
