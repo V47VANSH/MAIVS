@@ -169,6 +169,13 @@ fn router_beam_search(
     }
     if !any_above { return vec![]; }
 
+    // Adaptive Hopfield beta: beta(sigma^2) = beta_min + lambda_scale / (sigma^2 + eps) The passed
+    // `beta` is used as lambda_scale, with beta_min = 1.0.
+    let mean = raw_scores.iter().sum::<f32>() / (n as f32);
+    let variance = raw_scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (n as f32);
+    let adaptive_beta = 1.0 + (beta / (variance + 1e-5));
+
+
     // Numerically stable softmax with temperature beta, only over activated children.
     let mut exp_sum = 0.0f32;
     let mut probs: Vec<(usize, f32)> = raw_scores
@@ -178,7 +185,7 @@ fn router_beam_search(
             if s < activation_threshold {
                 (i, 0.0f32)
             } else {
-                let e = ((s - max_s) * beta).exp();
+                let e = ((s - max_s) * adaptive_beta).exp();
                 exp_sum += e;
                 (i, e)
             }
@@ -573,6 +580,41 @@ impl AIGVSEngine {
         }
     }
 
+    // --- tree construction ---
+
+    #[pyo3(signature = (leaf_id))]
+    fn check_connectivity(&self, _py: Python, leaf_id: String) -> Vec<Vec<String>> {
+        let l_idx = match self.node_id_to_index.get(&leaf_id) { Some(&i) => i, None => return vec![] };
+        let graph_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { graph_idx } => *graph_idx, _ => return vec![] };
+        let graph = &self.graphs[graph_idx];
+
+        let n = graph.chunk_ids.len();
+        if n == 0 { return vec![]; }
+
+        let mut visited = vec![false; n];
+        let mut components: Vec<Vec<String>> = Vec::new();
+
+        for i in 0..n {
+            if visited[i] || graph.deleted_indices.contains(&i) { continue; }
+            
+            let mut component = Vec::new();
+            let mut queue = vec![i];
+            visited[i] = true;
+
+            while let Some(curr) = queue.pop() {
+                component.push(graph.chunk_ids[curr].clone());
+                for &nb in &*graph.local_graph[curr].read() {
+                    if !visited[nb] && !graph.deleted_indices.contains(&nb) {
+                        visited[nb] = true;
+                        queue.push(nb);
+                    }
+                }
+            }
+            components.push(component);
+        }
+        components
+    }
+
     // --- search: parallel leaf traversal ---
     //   1. single-threaded walk to collect which leaves to search (routing is cheap, no rayon)
     //   2. rayon over the collected leaves; each leaf's NSW search is independent
@@ -658,7 +700,7 @@ impl AIGVSEngine {
     // from the root. Sequential: inserts route one at a time and py.allow_threads isn't worth it
     // here.
 
-    #[pyo3(signature = (node_id, query_vector, max_beam=1, target_confidence=1.0, beta=20.0))]
+    #[pyo3(signature = (node_id, query_vector, max_beam=1, target_confidence=1.0, beta=20.0, noise_level=0.0))]
     fn route_query(
         &self,
         _py: Python,
@@ -667,6 +709,7 @@ impl AIGVSEngine {
         max_beam: usize,
         target_confidence: f32,
         beta: f32,
+        noise_level: f32,
     ) -> Vec<String> {
         let node_idx = match self.node_id_to_index.get(&node_id) { Some(&i) => i, None => return vec![] };
         let (router_idx, children_mapping) = match &self.nodes[node_idx] {
@@ -684,16 +727,25 @@ impl AIGVSEngine {
         let mut raw_scores: Vec<f32> = Vec::with_capacity(n);
         let mut max_s = f32::NEG_INFINITY;
         for row in router.x_matrix.chunks_exact(dim) {
-            let s = dot(&q, row);
+            let mut s = dot(&q, row);
+            if noise_level > 0.0 {
+                // simple pseudo-random noise for Noisy Top-K MoE exploration
+                let noise = (rand::random::<f32>() * 2.0-1.0) * noise_level;
+                s += noise;
+            }
             if s > max_s { max_s = s; }
             raw_scores.push(s);
         }
+
+        let mean = raw_scores.iter().sum::<f32>() / (n as f32);
+        let variance = raw_scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (n as f32);
+        let adaptive_beta = 1.0 + (beta / (variance + 1e-5));
 
         let mut exp_sum = 0.0f32;
         let mut probs: Vec<(usize, f32)> = raw_scores
             .into_iter()
             .enumerate()
-            .map(|(i, s)| { let e = ((s - max_s) * beta).exp(); exp_sum += e; (i, e) })
+            .map(|(i, s)| { let e = ((s - max_s) * adaptive_beta).exp(); exp_sum += e; (i, e) })
             .collect();
         for (_, p) in probs.iter_mut() { *p /= exp_sum + 1e-9; }
         probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
