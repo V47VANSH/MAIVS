@@ -9,6 +9,11 @@ from src.aigvs.storage import LocalJSONStorage
 from src.aigvs.engine.nodes import DisjointFamily, BaseNode, JointFamily
 import aigvs_rust
 
+# --- architecture toggle --- True: let the tree split recursively into deep leaves. False: keep it
+# flat (macro trunks only).
+USE_DEEP_TREE = True
+# =====================================================================
+
 
 class AIGVSPipeline:
     """Runs the AIGVS hierarchy.
@@ -228,11 +233,15 @@ class AIGVSPipeline:
         trunk_chunks: List[List[TextChunk]] = [[] for _ in range(len(macro_centroids))]
         polysemy_count = 0
         for i, chunk in enumerate(chunks):
-            threshold = max_sims[i] - 0.08
-            assigned = np.where(sims[i] >= threshold)[0]
-            for t_idx in assigned:
-                trunk_chunks[t_idx].append(chunk)
-            if len(assigned) > 1:
+            best_idx = int(np.argmax(sims[i]))
+            trunk_chunks[best_idx].append(chunk)
+            
+            # Allow a max of 1 extra trunk if it's exceptionally close (within 0.01)
+            # This drastically cuts copying to <5% while preserving boundary cases
+            sorted_indices = np.argsort(sims[i])
+            second_best = int(sorted_indices[-2])
+            if second_best != best_idx and (sims[i][best_idx] - sims[i][second_best] < 0.01):
+                trunk_chunks[second_best].append(chunk)
                 polysemy_count += 1
                 
         print(f"[AIGVS] Polysemic assignments: {polysemy_count} chunks span multiple macro trunks")
@@ -287,9 +296,21 @@ class AIGVSPipeline:
             self.engine.native_batch_insert_to_leaf(new_leaf_id, c_ids, vectors_array)
             print(f"[AIGVS] native_batch_insert_to_leaf ({len(c_ids)}): {time.time()-t_start:.2f}s", flush=True)
             
+            # free the batch
+            del vectors_array
+            del embs
+            del c_ids
+            import gc
+            gc.collect()
+            
             new_leaf.centroid_vector = trunk.centroid_vector
             trunk.chunk_count = len(t_chunks)
             self.node_registry[new_leaf_id] = new_leaf
+
+            # TRIGGER RECURSIVE DEPTH BUILDING
+            # If the macro trunk's bulk-inserted leaf is too big, split it!
+            if USE_DEEP_TREE and new_leaf.active_count >= trunk.max_leaf_capacity:
+                trunk.execute_native_hopfield_split(new_leaf_id, self.storage, self)
 
         # final pass: update the root attractors to match what was inserted
         for trunk_id, trunk in self.root.children.items():
