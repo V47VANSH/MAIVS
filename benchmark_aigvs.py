@@ -11,6 +11,7 @@ if sys.platform == "win32" and os.environ.get("PYTHONUTF8") != "1":
     os.environ["PYTHONUTF8"] = "1"
     sys.exit(subprocess.call([sys.executable, "-X", "utf8"] + sys.argv))
 
+# import pyarrow before torch/tensorflow, otherwise it can crash on import
 import pyarrow
 import pyarrow.dataset
 
@@ -21,13 +22,15 @@ import psutil
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
+# Link your local AIGVS package
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-from aigvs.pipeline import AIGVSPipeline, USE_DEEP_TREE
+from aigvs.pipeline import AIGVSPipeline
 
-SAMPLE_SIZE = 100000
-TEST_QUERIES = 200
-EMBEDDING_DIM = 384
-TOP_K = 10
+# --- hyperparameters ---
+SAMPLE_SIZE = 100000  # Number of paragraphs to index (start small)
+TEST_QUERIES = 200   # Number of questions to evaluate
+EMBEDDING_DIM = 384  # MiniLM dimension size
+TOP_K = 10           # For Recall@10
 
 def load_msmarco_data():
     import ir_datasets
@@ -78,6 +81,7 @@ def load_msmarco_data():
     return docs, queries
 
 def calculate_mrr(results, golden_targets):
+    """Calculates the Reciprocal Rank for a single query."""
     for rank, res_id in enumerate(results, 1):
         if res_id in golden_targets:
             return 1.0 / rank
@@ -88,6 +92,7 @@ def print_database_states(aigvs_pipeline):
     print("         EXAMINING INTERNAL DB STATES")
     print("==============================================")
     
+    # --- AIGVS (rust) ---
     print(">>> [AIGVS Rust System State]")
     root_node = aigvs_pipeline.root
     active_attractors = len(root_node.children)
@@ -120,8 +125,9 @@ def print_database_states(aigvs_pipeline):
     print("==============================================\n")
 
 def main():
-    print("=== THE ULTRA-GRANULAR MSMARCO BENCHMARK (AIGVS ONLY) ===\n")
+    print("=== THE ULTRA-GRANULAR MSMARCO BENCHMARK (RUST EDITION) ===\n")
     
+    # 1. Load Data & Model
     docs, queries = load_msmarco_data()
     print(f"\n[3/6] Loading local embedding model (all-MiniLM-L6-v2)...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -130,6 +136,7 @@ def main():
     doc_ids = [str(d[0]) for d in docs]
     doc_texts = [d[1] for d in docs]
     
+    # CACHED EMBEDDING LOADING
     cache_file = f"msmarco_embeddings_cache_v2_{SAMPLE_SIZE}.npy"
     if os.path.exists(cache_file):
         print("-> Found cached embeddings! Loading instantly...")
@@ -139,6 +146,7 @@ def main():
         doc_embeddings = model.encode(doc_texts, show_progress_bar=True)
         np.save(cache_file, doc_embeddings) 
     
+    # Data container structured for deep paper analytics
     paper_metrics = {
         "experiment_parameters": {
             "sample_size": SAMPLE_SIZE,
@@ -154,18 +162,24 @@ def main():
     
     print("\n[4/6] STARTING THE WRITE RACE...")
     
-    aigvs_payload = []
-    for i in range(len(docs)):
-        vec = doc_embeddings[i].copy()
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
-        aigvs_payload.append({"id": doc_ids[i], "text": doc_texts[i], "embedding": vec}) 
-
+    # --- AIGVS (rust) ---
+    import gc
+    gc.collect()
     mem_before_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+
+    # Normalize vectors for AIGVS
+    aigvs_vectors = np.ascontiguousarray(doc_embeddings.copy(), dtype=np.float32)
+    norms = np.linalg.norm(aigvs_vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    aigvs_vectors = aigvs_vectors / norms
+    
+    aigvs_payload = [
+        {"id": doc_ids[i], "text": doc_texts[i], "embedding": aigvs_vectors[i].copy()} 
+        for i in range(len(docs))
+    ]
     print("\nBREADCRUMB 8: Initializing AIGVS Rust System...", flush=True)
     
-    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=32)
+    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=64)
     from aigvs.storage import InMemoryStorage
     aigvs_pipeline.storage = InMemoryStorage()
     
@@ -176,7 +190,7 @@ def main():
     print("BREADCRUMB 10: AIGVS Rust System survived!", flush=True)
     
     del aigvs_payload
-    import gc
+    del aigvs_vectors
     gc.collect()
     
     mem_after_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
@@ -184,6 +198,9 @@ def main():
     paper_metrics["global_performance"]["aigvs"]["memory_mb"] = aigvs_mem_mb
     print(f"Incremental Memory (AIGVS Rust): {aigvs_mem_mb:.1f} MB")
     
+    # ==========================================
+    # TEST B: THE READ RACE (ACCURACY & LATENCY)
+    # ==========================================
     print(f"\n[5/6] STARTING THE READ RACE (Running {TEST_QUERIES} Queries)...")
     
     a_lats = []
@@ -202,23 +219,10 @@ def main():
             "golden_parameters": golden_targets,
             "aigvs_metrics": {}
         }
-        
+
+        # --- AIGVS (rust) run ---
         t0 = time.perf_counter()
-        
-        if USE_DEEP_TREE:
-            # Deep tree requires wider search to find boundaries
-            _max_beam = 15
-            _target_conf = 0.999
-            _beta = 0.01
-            _ef = 300
-        else:
-            # Flat tree is fast and confident
-            _max_beam = 8
-            _target_conf = 0.95
-            _beta = 3.0
-            _ef = 100
-            
-        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, max_beam=_max_beam, target_confidence=_target_conf, beta=_beta, ef_search=_ef)
+        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, target_confidence=0.90, beta=10.0)
         aigvs_time = (time.perf_counter() - t0) * 1000
         aigvs_results = [item["id"] for item in aigvs_results_raw]
         aigvs_mrr = calculate_mrr(aigvs_results, golden_targets)
@@ -242,9 +246,10 @@ def main():
         paper_metrics["global_performance"][key]["p99_latency_ms"] = float(np.percentile(lats, 99))
         paper_metrics["global_performance"][key]["mean_mrr"] = float(np.mean(mrrs))
 
-    print("\n[6/6] Freezing full execution trace to benchmark_results_aigvs.json...")
-    with open("benchmark_results_aigvs.json", "w") as f:
+    print("\n[6/6] Freezing full execution trace to benchmark_results_msmarco_rust.json...")
+    with open("benchmark_results_msmarco_rust.json", "w") as f:
         json.dump(paper_metrics, f, indent=4)
+    print("Done! Every question, retrieved document array, and millisecond metric is safely stored.")
 
     print("\n==============================================")
     print("             FINAL BENCHMARK SCORECARD")
@@ -266,5 +271,9 @@ def main():
     if hasattr(aigvs_pipeline.engine, "print_profile_stats"):
         aigvs_pipeline.engine.print_profile_stats()
 
+    from src.aigvs.profiler import report
+    report()
+
 if __name__ == "__main__":
     main()
+

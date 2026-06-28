@@ -101,7 +101,7 @@ def print_database_states(faiss_index, chroma_collection, aigvs_pipeline):
         print(f"HNSW Max Links (M):      {faiss_index.hnsw.nb_neighbors(0) if faiss_index.ntotal > 0 else 'N/A'}")
         print(f"Graph Storage Type:      HNSW Graph")
     else:
-        print(f"Graph Storage Type:      Flat / Uncompressed vectors (Fallback mode)")
+        print(f"Graph Storage Type:      IVF-Flat")
     print("-" * 30)
 
     # --- 2. chroma ---
@@ -186,23 +186,34 @@ def main():
     print("\n[4/6] STARTING THE WRITE RACE...")
     
     # --- faiss (HNSW) ---
+    import gc
+    gc.collect()
     mem_before_faiss = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    
     print("BREADCRUMB 1: Setting up FAISS vectors...", flush=True)
     faiss_vectors = np.ascontiguousarray(doc_embeddings.copy(), dtype=np.float32)
     faiss.normalize_L2(faiss_vectors)
     
-    print("BREADCRUMB 2: Initializing FAISS Index (HNSW)...", flush=True)
+    print("BREADCRUMB 2: Initializing FAISS Index (IVF-Flat)...", flush=True)
+    start_time = time.time()
     faiss.omp_set_num_threads(1)
-    faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIM, 32)
-    faiss_index.hnsw.efConstruction = 200
-    faiss_index.hnsw.efSearch = 128
+    nlist = 4
+    quantizer = faiss.IndexFlatIP(EMBEDDING_DIM)
+    faiss_index = faiss.IndexIVFFlat(quantizer, EMBEDDING_DIM, nlist, faiss.METRIC_INNER_PRODUCT)
+    print("BREADCRUMB 2.5: Training FAISS Index...", flush=True)
+    faiss_index.train(faiss_vectors)
+    faiss_index.nprobe = 4
     
     print("BREADCRUMB 3: Adding vectors to FAISS...", flush=True)
-    start_time = time.time()
     faiss_index.add(faiss_vectors)
-    paper_metrics["global_performance"]["faiss"]["build_time_sec"] = time.time() - start_time
+    
     faiss_id_map = {i: doc_ids[i] for i in range(len(docs))}
+    
+    paper_metrics["global_performance"]["faiss"]["build_time_sec"] = time.time() - start_time
     print("BREADCRUMB 4: FAISS survived!", flush=True)
+    
+    del faiss_vectors
+    gc.collect()
     
     mem_after_faiss = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     faiss_mem_mb = mem_after_faiss - mem_before_faiss
@@ -210,13 +221,14 @@ def main():
     print(f"Incremental Memory (FAISS): {faiss_mem_mb:.1f} MB\n")
 
     # --- ChromaDB (hnswlib under the hood) ---
+    gc.collect()
+    mem_before_chroma = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    
     print("BREADCRUMB 5: Initializing ChromaDB...", flush=True)
     chroma_client = chromadb.EphemeralClient()
     chroma_collection = chroma_client.create_collection(name="benchmark_msmarco_rust", metadata={"hnsw:space": "cosine", "hnsw:construction_ef": 32, "hnsw:M": 32})
     
     print("BREADCRUMB 6: Adding vectors to ChromaDB...", flush=True)
-    mem_before_chroma = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-    
     start_time = time.time()
     
     batch_size = 5000
@@ -230,20 +242,29 @@ def main():
     paper_metrics["global_performance"]["chroma"]["build_time_sec"] = time.time() - start_time
     print("BREADCRUMB 7: ChromaDB survived!", flush=True)
     
+    gc.collect()
     mem_after_chroma = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     chroma_mem_mb = mem_after_chroma - mem_before_chroma
     paper_metrics["global_performance"]["chroma"]["memory_mb"] = chroma_mem_mb
     print(f"Incremental Memory (Chroma): {chroma_mem_mb:.1f} MB\n")
 
     # --- AIGVS (rust) ---
+    gc.collect()
+    mem_before_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    
+    # Normalize vectors for AIGVS
+    aigvs_vectors = np.ascontiguousarray(doc_embeddings.copy(), dtype=np.float32)
+    norms = np.linalg.norm(aigvs_vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    aigvs_vectors = aigvs_vectors / norms
+
     aigvs_payload = [
-        {"id": doc_ids[i], "text": doc_texts[i], "embedding": faiss_vectors[i].copy()} 
+        {"id": doc_ids[i], "text": doc_texts[i], "embedding": aigvs_vectors[i].copy()} 
         for i in range(len(docs))
     ]
-    mem_before_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     print("\nBREADCRUMB 8: Initializing AIGVS Rust System...", flush=True)
     
-    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=32)
+    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=64)
     from aigvs.storage import InMemoryStorage
     aigvs_pipeline.storage = InMemoryStorage()
     
@@ -254,7 +275,7 @@ def main():
     print("BREADCRUMB 10: AIGVS Rust System survived!", flush=True)
     
     del aigvs_payload
-    import gc
+    del aigvs_vectors
     gc.collect()
     
     mem_after_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
@@ -327,7 +348,7 @@ def main():
 
         # --- AIGVS (rust) run ---
         t0 = time.perf_counter()
-        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, target_confidence=0.95, beta=5.0)
+        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, target_confidence=0.98, beta=5)
         aigvs_time = (time.perf_counter() - t0) * 1000
         aigvs_results = [item["id"] for item in aigvs_results_raw]
         aigvs_mrr = calculate_mrr(aigvs_results, golden_targets)
