@@ -11,8 +11,7 @@ class InMemoryStorage:
         self.memory_store[chunk.chunk_id] = {
             "id": chunk.chunk_id,
             "text": chunk.text,
-            "metadata": chunk.metadata,
-            "embedding": chunk.embedding  # keep the embedding
+            "metadata": chunk.metadata
         }
 
     def read_chunk(self, chunk_id: str) -> Optional[TextChunk]:
@@ -22,7 +21,7 @@ class InMemoryStorage:
                 chunk_id=data["id"],
                 text=data["text"],
                 metadata=data["metadata"],
-                embedding=data["embedding"]  # keep the embedding
+                embedding=None
             )
         return None
 

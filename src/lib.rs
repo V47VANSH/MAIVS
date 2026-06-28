@@ -50,7 +50,7 @@ enum ExecutionNode {
         children_mapping: HashMap<String, usize>,
     },
     Leaf {
-        graph_idx: usize,
+        leaf_idx: usize,
     },
 }
 
@@ -61,7 +61,7 @@ struct AIGVSEngine {
     node_id_to_index: HashMap<String, usize>,
     root_index: Option<usize>,
     routers: Vec<RustHopfieldRouterInternal>,
-    graphs: Vec<RustNSWGraphInternal>,
+    leaves: Vec<RustFlatLeafInternal>,
 }
 
 struct RustHopfieldRouterInternal {
@@ -70,15 +70,11 @@ struct RustHopfieldRouterInternal {
     x_matrix: Vec<f32>,
 }
 
-struct RustNSWGraphInternal {
+struct RustFlatLeafInternal {
     chunk_ids: Vec<String>,
     /// Flattened row-major vector cache: row i = vector_cache[i*dim .. (i+1)*dim].
     vector_cache: Vec<i8>,
-    local_graph: Vec<RwLock<Vec<usize>>>,
     deleted_indices: HashSet<usize>,
-    entry_point_idx: Option<usize>,
-    max_connections: usize,
-    ef_construction: usize,
 }
 
 // --- dot product --- 4-way unrolled. For normalised vectors this is cosine similarity. With -C
@@ -107,6 +103,50 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline(always)]
 fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { dot_i8_avx2(a, b) };
+        }
+    }
+    dot_i8_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let unrolled = len - (len % 32);
+    let mut sum = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < unrolled {
+        let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        
+        let va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+        let vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+        let va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
+        let vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
+        
+        let dot_lo = _mm256_madd_epi16(va_lo, vb_lo);
+        let dot_hi = _mm256_madd_epi16(va_hi, vb_hi);
+        
+        sum = _mm256_add_epi32(sum, _mm256_add_epi32(dot_lo, dot_hi));
+        i += 32;
+    }
+    let mut arr = [0i32; 8];
+    _mm256_storeu_si256(arr.as_mut_ptr() as *mut __m256i, sum);
+    let mut total = arr.iter().sum();
+    for j in i..len {
+        total += *a.get_unchecked(j) as i32 * *b.get_unchecked(j) as i32;
+    }
+    total
+}
+
+#[inline(always)]
+fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
     let len = a.len();
     let unrolled = len - (len % 8);
     let mut s = 0i32;
@@ -169,12 +209,20 @@ fn router_beam_search(
     }
     if !any_above { return vec![]; }
 
-    // Adaptive Hopfield beta: beta(sigma^2) = beta_min + lambda_scale / (sigma^2 + eps) The passed
-    // `beta` is used as lambda_scale, with beta_min = 1.0.
-    let mean = raw_scores.iter().sum::<f32>() / (n as f32);
-    let variance = raw_scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (n as f32);
-    let adaptive_beta = 1.0 + (beta / (variance + 1e-5));
-
+    let mut dynamic_beta = beta;
+    if beta == 0.0 && n > 1 {
+        let mut mean = 0.0;
+        for &s in raw_scores.iter() { mean += s; }
+        mean /= n as f32;
+        let mut var = 0.0;
+        for &s in raw_scores.iter() { var += (s - mean) * (s - mean); }
+        var /= n as f32;
+        if var > 1e-6 {
+            dynamic_beta = 1.0 / var.sqrt();
+        } else {
+            dynamic_beta = 1.0;
+        }
+    }
 
     // Numerically stable softmax with temperature beta, only over activated children.
     let mut exp_sum = 0.0f32;
@@ -185,7 +233,7 @@ fn router_beam_search(
             if s < activation_threshold {
                 (i, 0.0f32)
             } else {
-                let e = ((s - max_s) * adaptive_beta).exp();
+                let e = ((s - max_s) * dynamic_beta).exp();
                 exp_sum += e;
                 (i, e)
             }
@@ -219,129 +267,29 @@ fn router_beam_search(
     selected
 }
 
-// --- NSW search --- Standard HNSW search-layer: max-heap for the frontier, min-heap for the
-// results, stop when the best unseen candidate is worse than the worst result.
-
-fn nsw_search_candidates(
-    vector_cache: &[i8],
-    local_graph: &[RwLock<Vec<usize>>],
-    deleted_indices: &HashSet<usize>,
-    q: &[i8],
-    dim: usize,
-    entry: usize,
-    ef: usize,
-    visited: &mut [bool],
-) -> BinaryHeap<(Score, usize)> {
-    let mut candidates: BinaryHeap<(Score, usize)> = BinaryHeap::new();
-    let mut results:    BinaryHeap<(MinScore, usize)> = BinaryHeap::new();
-
-    let entry_score = dot_i8(q, &vector_cache[entry * dim..(entry + 1) * dim]) as f32;
-    candidates.push((Score(entry_score), entry));
-    if !deleted_indices.contains(&entry) {
-        results.push((MinScore(entry_score), entry));
-    }
-    visited[entry] = true;
-
-    while let Some((Score(cand_score), curr)) = candidates.pop() {
-        if results.len() >= ef {
-            if let Some(&(MinScore(worst), _)) = results.peek() {
-                if cand_score < worst { break; }
-            }
-        }
-        for &nb in &*local_graph[curr].read() {
-            if !visited[nb] {
-                visited[nb] = true;
-                let nb_score = dot_i8(q, &vector_cache[nb * dim..(nb + 1) * dim]) as f32;
-                candidates.push((Score(nb_score), nb));
-                if !deleted_indices.contains(&nb) {
-                    if results.len() < ef {
-                        results.push((MinScore(nb_score), nb));
-                    } else if let Some(&(MinScore(worst), _)) = results.peek() {
-                        if nb_score > worst {
-                            results.pop();
-                            results.push((MinScore(nb_score), nb));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    results.into_iter()
-        .map(|(MinScore(s), idx)| (Score(s), idx))
-        .collect()
-}
-
-/// Query a single leaf, returning up to `ef` results as (chunk_id, score) sorted descending.
-fn nsw_query(
-    graph: &RustNSWGraphInternal,
+// --- NSW insert helpers ---
+fn flat_scan(
+    leaf: &RustFlatLeafInternal,
     q: &[i8],
     dim: usize,
     ef: usize,
 ) -> Vec<(String, f32)> {
-    let ep = match graph.entry_point_idx { Some(e) => e, None => return vec![] };
-    let mut visited = vec![false; graph.local_graph.len()];
-    let heap = nsw_search_candidates(
-        &graph.vector_cache, &graph.local_graph, &graph.deleted_indices, q, dim, ep, ef, &mut visited
-    );
-    let mut v: Vec<(Score, usize)> = heap.into_sorted_vec();
-    v.reverse();
-    v.into_iter()
-        .map(|(Score(s), idx)| (graph.chunk_ids[idx].clone(), s))
-        .collect()
-}
-
-// --- NSW insert helpers ---
-
-fn heuristic_select(
-    candidates: &[(usize, f32)],
-    vector_cache: &[i8],
-    dim: usize,
-    m: usize,
-) -> Vec<usize> {
-    let mut result = Vec::with_capacity(m);
-    for &(cand_idx, cand_sim_to_pivot) in candidates {
-        if result.len() >= m { break; }
-        let mut is_good = true;
-        let cand_vec = &vector_cache[cand_idx * dim..(cand_idx + 1) * dim];
-        for &r_idx in &result {
-            let r_vec = &vector_cache[r_idx * dim..(r_idx + 1) * dim];
-            let sim_to_r = dot_i8(cand_vec, r_vec) as f32;
-            if sim_to_r > cand_sim_to_pivot {
-                is_good = false;
-                break;
-            }
-        }
-        if is_good {
-            result.push(cand_idx);
-        }
-    }
-    if result.len() < m {
-        for &(cand_idx, _) in candidates {
-            if result.len() >= m { break; }
-            if !result.contains(&cand_idx) {
-                result.push(cand_idx);
+    let mut results: BinaryHeap<(MinScore, usize)> = BinaryHeap::with_capacity(ef);
+    for (i, row) in leaf.vector_cache.chunks_exact(dim).enumerate() {
+        if leaf.deleted_indices.contains(&i) { continue; }
+        let s = dot_i8(q, row) as f32;
+        if results.len() < ef {
+            results.push((MinScore(s), i));
+        } else if let Some(&(MinScore(worst), _)) = results.peek() {
+            if s > worst {
+                results.pop();
+                results.push((MinScore(s), i));
             }
         }
     }
-    result
-}
-
-fn prune_neighbours(
-    neighbours: &mut Vec<usize>,
-    vector_cache: &[i8],
-    pivot: usize,
-    dim: usize,
-    max_conn: usize,
-) {
-    if neighbours.len() <= max_conn { return; }
-    let pivot_vec = &vector_cache[pivot * dim..(pivot + 1) * dim];
-    let mut scored: Vec<(usize, f32)> = neighbours
-        .iter()
-        .map(|&nb| (nb, dot_i8(pivot_vec, &vector_cache[nb * dim..(nb + 1) * dim]) as f32))
-        .collect();
-    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    *neighbours = heuristic_select(&scored, vector_cache, dim, max_conn);
+    let mut v: Vec<(f32, usize)> = results.into_iter().map(|(MinScore(s), idx)| (s, idx)).collect();
+    v.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    v.into_iter().map(|(s, idx)| (leaf.chunk_ids[idx].clone(), s)).collect()
 }
 
 // --- NSW insert helpers ---
@@ -356,7 +304,7 @@ impl AIGVSEngine {
             node_id_to_index: HashMap::new(),
             root_index: None,
             routers: Vec::new(),
-            graphs: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
@@ -379,20 +327,16 @@ impl AIGVSEngine {
         }
     }
 
-    #[pyo3(signature = (node_id, parent_id, max_connections=16, ef_construction=100))]
-    fn register_leaf(&mut self, node_id: String, parent_id: String, max_connections: usize, ef_construction: usize) {
+    #[pyo3(signature = (node_id, parent_id))]
+    fn register_leaf(&mut self, node_id: String, parent_id: String) {
         let node_idx = self.nodes.len();
-        let graph_idx = self.graphs.len();
-        self.graphs.push(RustNSWGraphInternal {
+        let leaf_idx = self.leaves.len();
+        self.leaves.push(RustFlatLeafInternal {
             chunk_ids: Vec::new(),
             vector_cache: Vec::new(),
-            local_graph: Vec::new(),
             deleted_indices: HashSet::new(),
-            entry_point_idx: None,
-            max_connections,
-            ef_construction,
         });
-        self.nodes.push(ExecutionNode::Leaf { graph_idx });
+        self.nodes.push(ExecutionNode::Leaf { leaf_idx });
         self.node_id_to_index.insert(node_id.clone(), node_idx);
         if let Some(&p_idx) = self.node_id_to_index.get(&parent_id) {
             if let ExecutionNode::Branch { ref mut children_mapping, .. } = self.nodes[p_idx] {
@@ -441,178 +385,44 @@ impl AIGVSEngine {
 
     fn native_insert_to_leaf(&mut self, leaf_id: String, chunk_id: String, vector: PyReadonlyArray1<f32>) {
         let l_idx = match self.node_id_to_index.get(&leaf_id) { Some(&i) => i, None => return };
-        let graph_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { graph_idx } => *graph_idx, _ => return };
+        let leaf_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { leaf_idx } => *leaf_idx, _ => return };
 
-        let graph = &mut self.graphs[graph_idx];
+        let leaf = &mut self.leaves[leaf_idx];
         let vec_data_f32: Vec<f32> = vector.as_array().iter().copied().collect();
         let vec_data: Vec<i8> = vec_data_f32.iter().map(|&x| (x * 127.0).clamp(-127.0, 127.0) as i8).collect();
-        let new_idx = graph.chunk_ids.len();
-        let dim = self.embedding_dim;
-        let m = graph.max_connections;
-        let ef = graph.ef_construction;
-
-        graph.chunk_ids.push(chunk_id);
-        graph.vector_cache.extend_from_slice(&vec_data);
-        graph.local_graph.push(RwLock::new(Vec::with_capacity(m)));
-
-        if new_idx == 0 {
-            graph.entry_point_idx = Some(0);
-            return;
-        }
-
-        let ep = graph.entry_point_idx.unwrap();
-
-        // Phase 1: find ef_construction best candidates via greedy graph search.
-        let mut visited = vec![false; graph.local_graph.len()];
-        let candidates = nsw_search_candidates(
-            &graph.vector_cache, &graph.local_graph, &graph.deleted_indices,
-            &vec_data, dim, ep, ef, &mut visited
-        );
-
-        // Phase 2: select best M neighbours from candidates.
-        let mut cand_vec: Vec<(usize, f32)> = candidates.into_sorted_vec().into_iter().rev().map(|(Score(s), idx)| (idx, s)).collect();
-        let neighbours = heuristic_select(&cand_vec, &graph.vector_cache, dim, m);
-
-        // Phase 3: bidirectional wiring with shrinkage.
-        for nb_idx in neighbours {
-            graph.local_graph[new_idx].write().push(nb_idx);
-            let mut nb_lock = graph.local_graph[nb_idx].write();
-            nb_lock.push(new_idx);
-            if nb_lock.len() > m {
-                let mut pruned = nb_lock.clone();
-                prune_neighbours(&mut pruned, &graph.vector_cache, nb_idx, dim, m);
-                *nb_lock = pruned;
-            }
-        }
-
-        // Update entry point to the best-connected node (densest region = best entry).
-        if graph.local_graph[new_idx].read().len() > graph.local_graph[ep].read().len() {
-            graph.entry_point_idx = Some(new_idx);
-        }
+        leaf.chunk_ids.push(chunk_id);
+        leaf.vector_cache.extend_from_slice(&vec_data);
     }
 
     #[pyo3(signature = (leaf_id, chunk_ids, vectors))]
     fn native_batch_insert_to_leaf(&mut self, leaf_id: String, chunk_ids: Vec<String>, vectors: PyReadonlyArray2<f32>) {
         let l_idx = match self.node_id_to_index.get(&leaf_id) { Some(&i) => i, None => return };
-        let graph_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { graph_idx } => *graph_idx, _ => return };
-
-        let graph = &mut self.graphs[graph_idx];
-        let dim = self.embedding_dim;
-        let m = graph.max_connections;
-        let ef = graph.ef_construction;
-
+        let leaf_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { leaf_idx } => *leaf_idx, _ => return };
+        let leaf = &mut self.leaves[leaf_idx];
         let vectors_arr = vectors.as_array();
         let n_new = chunk_ids.len();
         if n_new == 0 { return; }
-
-        let start_idx = graph.chunk_ids.len();
-
-        graph.chunk_ids.extend(chunk_ids.into_iter());
+        
+        leaf.chunk_ids.extend(chunk_ids.into_iter());
         if let Some(slc) = vectors_arr.as_slice() {
             let scaled: Vec<i8> = slc.iter().map(|&x| (x * 127.0).clamp(-127.0, 127.0) as i8).collect();
-            graph.vector_cache.extend_from_slice(&scaled);
+            leaf.vector_cache.extend_from_slice(&scaled);
         } else {
             for i in 0..n_new {
                 let row = vectors_arr.row(i);
                 let scaled: Vec<i8> = row.iter().map(|&x| (x * 127.0).clamp(-127.0, 127.0) as i8).collect();
-                graph.vector_cache.extend(scaled);
+                leaf.vector_cache.extend(scaled);
             }
         }
-        for _ in 0..n_new {
-            graph.local_graph.push(RwLock::new(Vec::with_capacity(m)));
-        }
-
-        let mut parallel_start = 0;
-        if start_idx == 0 {
-            graph.entry_point_idx = Some(0);
-            parallel_start = 1;
-        }
-
-        let total_nodes = graph.local_graph.len();
-        let vector_cache = &graph.vector_cache;
-        let local_graph = &graph.local_graph;
-        let deleted_indices = &graph.deleted_indices;
-        let ep = graph.entry_point_idx.unwrap();
-
-        let indices: Vec<usize> = (start_idx + parallel_start .. start_idx + n_new).collect();
-        indices.into_par_iter().for_each(|new_idx| {
-            let mut visited = vec![false; total_nodes];
-            let vec_data = &vector_cache[new_idx * dim .. (new_idx + 1) * dim];
-
-            let candidates = nsw_search_candidates(
-                vector_cache, local_graph, deleted_indices,
-                vec_data, dim, ep, ef, &mut visited
-            );
-
-            let mut cand_vec: Vec<(usize, f32)> = candidates.into_sorted_vec().into_iter().rev().map(|(Score(s), idx)| (idx, s)).collect();
-            let neighbours = heuristic_select(&cand_vec, vector_cache, dim, m);
-
-            for nb_idx in neighbours {
-                local_graph[new_idx].write().push(nb_idx);
-                let mut nb_lock = local_graph[nb_idx].write();
-                nb_lock.push(new_idx);
-                if nb_lock.len() > m {
-                    let mut pruned = nb_lock.clone();
-                    prune_neighbours(&mut pruned, vector_cache, nb_idx, dim, m);
-                    *nb_lock = pruned;
-                }
-            }
-        });
-
-        let mut best_ep = graph.entry_point_idx.unwrap();
-        let mut best_deg = graph.local_graph[best_ep].read().len();
-        for i in start_idx .. start_idx + n_new {
-            let deg = graph.local_graph[i].read().len();
-            if deg > best_deg {
-                best_deg = deg;
-                best_ep = i;
-            }
-        }
-        graph.entry_point_idx = Some(best_ep);
     }
 
     fn native_mark_deleted(&mut self, leaf_id: String, chunk_id: String) {
         let l_idx = match self.node_id_to_index.get(&leaf_id) { Some(&i) => i, None => return };
-        let graph_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { graph_idx } => *graph_idx, _ => return };
-        let graph = &mut self.graphs[graph_idx];
+        let leaf_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { leaf_idx } => *leaf_idx, _ => return };
+        let graph = &mut self.leaves[leaf_idx];
         if let Some(pos) = graph.chunk_ids.iter().position(|x| *x == chunk_id) {
             graph.deleted_indices.insert(pos);
         }
-    }
-
-    // --- tree construction ---
-
-    #[pyo3(signature = (leaf_id))]
-    fn check_connectivity(&self, _py: Python, leaf_id: String) -> Vec<Vec<String>> {
-        let l_idx = match self.node_id_to_index.get(&leaf_id) { Some(&i) => i, None => return vec![] };
-        let graph_idx = match &self.nodes[l_idx] { ExecutionNode::Leaf { graph_idx } => *graph_idx, _ => return vec![] };
-        let graph = &self.graphs[graph_idx];
-
-        let n = graph.chunk_ids.len();
-        if n == 0 { return vec![]; }
-
-        let mut visited = vec![false; n];
-        let mut components: Vec<Vec<String>> = Vec::new();
-
-        for i in 0..n {
-            if visited[i] || graph.deleted_indices.contains(&i) { continue; }
-            
-            let mut component = Vec::new();
-            let mut queue = vec![i];
-            visited[i] = true;
-
-            while let Some(curr) = queue.pop() {
-                component.push(graph.chunk_ids[curr].clone());
-                for &nb in &*graph.local_graph[curr].read() {
-                    if !visited[nb] && !graph.deleted_indices.contains(&nb) {
-                        visited[nb] = true;
-                        queue.push(nb);
-                    }
-                }
-            }
-            components.push(component);
-        }
-        components
     }
 
     // --- search: parallel leaf traversal ---
@@ -641,13 +451,13 @@ impl AIGVSEngine {
         let dim = self.embedding_dim;
         let nodes  = &self.nodes;
         let routers = &self.routers;
-        let graphs  = &self.graphs;
+        let leaves  = &self.leaves;
 
         py.allow_threads(|| {
             // phase 1: sequential routing to collect leaf indices (beam x children per level,
             // small)
             let mut stack: Vec<usize> = vec![root];
-            let mut leaf_graph_indices: Vec<usize> = Vec::new();
+            let mut leaf_indices: Vec<usize> = Vec::new();
 
             while let Some(curr_idx) = stack.pop() {
                 match &nodes[curr_idx] {
@@ -659,21 +469,21 @@ impl AIGVSEngine {
                         );
                         stack.extend(selected);
                     }
-                    ExecutionNode::Leaf { graph_idx } => {
-                        leaf_graph_indices.push(*graph_idx);
+                    ExecutionNode::Leaf { leaf_idx } => {
+                        leaf_indices.push(*leaf_idx);
                     }
                 }
             }
 
-            LEAVES_VISITED.fetch_add(leaf_graph_indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            LEAVES_VISITED.fetch_add(leaf_indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // phase 2: parallel NSW search over the selected leaves; each task has its own result
             // Vec, merged afterwards
             let t_child = std::time::Instant::now();
-            let all_candidates: Vec<(String, f32)> = leaf_graph_indices
+            let all_candidates: Vec<(String, f32)> = leaf_indices
                 .par_iter()
-                .flat_map(|&gidx| {
-                    nsw_query(&graphs[gidx], &q_i8, dim, ef)
+                .flat_map(|&lidx| {
+                    flat_scan(&leaves[lidx], &q_i8, dim, ef)
                 })
                 .collect();
             CHILD_QUERY_TOTAL_US.fetch_add(t_child.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -700,7 +510,7 @@ impl AIGVSEngine {
     // from the root. Sequential: inserts route one at a time and py.allow_threads isn't worth it
     // here.
 
-    #[pyo3(signature = (node_id, query_vector, max_beam=1, target_confidence=1.0, beta=20.0, noise_level=0.0))]
+    #[pyo3(signature = (node_id, query_vector, max_beam=1, target_confidence=1.0, beta=20.0))]
     fn route_query(
         &self,
         _py: Python,
@@ -709,7 +519,6 @@ impl AIGVSEngine {
         max_beam: usize,
         target_confidence: f32,
         beta: f32,
-        noise_level: f32,
     ) -> Vec<String> {
         let node_idx = match self.node_id_to_index.get(&node_id) { Some(&i) => i, None => return vec![] };
         let (router_idx, children_mapping) = match &self.nodes[node_idx] {
@@ -727,25 +536,16 @@ impl AIGVSEngine {
         let mut raw_scores: Vec<f32> = Vec::with_capacity(n);
         let mut max_s = f32::NEG_INFINITY;
         for row in router.x_matrix.chunks_exact(dim) {
-            let mut s = dot(&q, row);
-            if noise_level > 0.0 {
-                // simple pseudo-random noise for Noisy Top-K MoE exploration
-                let noise = (rand::random::<f32>() * 2.0-1.0) * noise_level;
-                s += noise;
-            }
+            let s = dot(&q, row);
             if s > max_s { max_s = s; }
             raw_scores.push(s);
         }
-
-        let mean = raw_scores.iter().sum::<f32>() / (n as f32);
-        let variance = raw_scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (n as f32);
-        let adaptive_beta = 1.0 + (beta / (variance + 1e-5));
 
         let mut exp_sum = 0.0f32;
         let mut probs: Vec<(usize, f32)> = raw_scores
             .into_iter()
             .enumerate()
-            .map(|(i, s)| { let e = ((s - max_s) * adaptive_beta).exp(); exp_sum += e; (i, e) })
+            .map(|(i, s)| { let e = ((s - max_s) * beta).exp(); exp_sum += e; (i, e) })
             .collect();
         for (_, p) in probs.iter_mut() { *p /= exp_sum + 1e-9; }
         probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));

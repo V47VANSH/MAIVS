@@ -46,9 +46,6 @@ class JointFamily(BaseNode):
         self.ef_construction: int = cfg.get("ef_construction", 100)
         self.chunk_ids: List[str] = []
         self.deleted_indices: Set[int] = set()
-        
-        # Growing Neural Gas: track error (variance)
-        self.sum_sq_dist: float = 0.0
 
     # --- base ---
 
@@ -67,17 +64,12 @@ class JointFamily(BaseNode):
             self.centroid_vector = chunk.embedding.copy()
         else:
             n = len(self.chunk_ids)
-            prev_centroid = self.centroid_vector.copy()
             self.centroid_vector = (
                 (self.centroid_vector * (n - 1)) + chunk.embedding
             ) / n
             norm = np.linalg.norm(self.centroid_vector)
             if norm > 0:
                 self.centroid_vector /= norm
-                
-            # Accumulate squared distance to centroid (running variance / error)
-            dist = np.linalg.norm(chunk.embedding - self.centroid_vector)
-            self.sum_sq_dist += dist ** 2
 
         pipeline_ref.engine.native_insert_to_leaf(
             self.node_id, chunk.chunk_id, chunk.embedding
@@ -159,7 +151,7 @@ class DisjointFamily(BaseNode):
 
         target_child_ids: List[str] = pipeline_ref.engine.route_query(
             self.node_id, chunk.embedding,
-            max_beam=1, target_confidence=0.95, beta=10.0, noise_level=0.1,
+            max_beam=1, target_confidence=0.95, beta=10.0,
         )
 
         if not target_child_ids or not self.children:
@@ -189,15 +181,13 @@ class DisjointFamily(BaseNode):
                 self.centroid_vector /= norm
         self.chunk_count += 1
 
-        if isinstance(target_child, JointFamily):
-            variance = target_child.sum_sq_dist / max(1, target_child.active_count)
-            # GNG-style split: split when the leaf's variance (topological error) is high. Variance
-            # threshold 0.05 plus a minimum size to avoid tiny splits, and a hard capacity limit as
-            # a fallback.
-            if (variance > 0.05 and target_child.active_count >= 512) or target_child.active_count >= self.max_leaf_capacity:
-                self.execute_native_hopfield_split(
-                    primary_child_id, storage, pipeline_ref
-                )
+        if (
+            isinstance(target_child, JointFamily)
+            and target_child.active_count >= self.max_leaf_capacity
+        ):
+            self.execute_native_hopfield_split(
+                primary_child_id, storage, pipeline_ref
+            )
 
     def _create_leaf_and_insert(
         self, chunk, storage, pipeline_ref: "AIGVSPipeline"
@@ -258,69 +248,55 @@ class DisjointFamily(BaseNode):
 
         X = np.array(X_list, dtype=np.float32)  # (N, D)
 
-        # 0. connectivity check (Leiden-style): before clustering, see if the leaf's graph is
-        #    already
-        # disconnected
-        components = pipeline_ref.engine.check_connectivity(child_id)
-        if len(components) > 1:
-            print(f"[AIGVS] Leiden Refinement: Splitting disconnected leaf {child_id} into {len(components)} components.")
-            # Map chunk_id to its component index
-            chunk_to_comp = {}
-            for comp_idx, comp_chunks in enumerate(components):
-                for cid in comp_chunks:
-                    chunk_to_comp[cid] = comp_idx
-                    
-            assignments = np.array([chunk_to_comp[chunk.chunk_id] for chunk in active_chunks])
-            num_branches = len(components)
-            # We skip K-Means entirely and just use the topological split.
-        else:
-            # 1. farthest-first seeds
-            avg = np.mean(X, axis=0)
-            avg_norm = np.linalg.norm(avg)
-            if avg_norm > 0:
-                avg /= avg_norm
-            seeds = [X[int(np.argmax(X @ avg))].copy()]
-    
-            max_seeds = min(15, max(3, int(np.sqrt(len(X)))))
-            for _ in range(1, max_seeds):
-                sims = X @ np.array(seeds).T          # (N, K)
-                max_sim = np.max(sims, axis=1)         # (N,)
-                furthest = int(np.argmin(max_sim))
-                if max_sim[furthest] > cohesion_threshold:
-                    break
-                seeds.append(X[furthest].copy())
-    
-            centroids = np.array(seeds, dtype=np.float32)
-            num_branches = len(centroids)
-    
-            # 2. stop early if the leaf is one cohesive community
-            if num_branches == 1:
-                # one cohesive community: raise the capacity and keep going
-                bloated_node.max_connections = min(
-                    bloated_node.max_connections + pipeline_ref.max_connections, 64
-                )
-                self.max_leaf_capacity += 100
-                return
-    
-            # 3. variance-adaptive Hopfield convergence
-            lambda_scale = 5.0
-            for _ in range(15):
-                prev = centroids.copy()
-                scores = X @ centroids.T                              # (N, K)
-                variances = np.var(scores, axis=0)                    # (K,)
-                betas = lambda_scale / (variances + 1e-5)
-                scaled = scores * betas
-                shifted = scaled - np.max(scaled, axis=1, keepdims=True)
-                exp_s = np.exp(shifted)
-                weights = exp_s / (exp_s.sum(axis=1, keepdims=True) + 1e-9)
-                centroids = weights.T @ X                             # (K, D)
-                norms = np.linalg.norm(centroids, axis=1, keepdims=True)
-                centroids /= norms + 1e-9
-                if np.allclose(centroids, prev, atol=1e-6):
-                    break
-    
-            sims = X @ centroids.T
-            assignments = np.argmax(sims, axis=1)
+        # 1. farthest-first seeds
+        avg = np.mean(X, axis=0)
+        avg_norm = np.linalg.norm(avg)
+        if avg_norm > 0:
+            avg /= avg_norm
+        seeds = [X[int(np.argmax(X @ avg))].copy()]
+
+        max_seeds = min(15, max(3, int(np.sqrt(len(X)))))
+        for _ in range(1, max_seeds):
+            sims = X @ np.array(seeds).T          # (N, K)
+            max_sim = np.max(sims, axis=1)         # (N,)
+            furthest = int(np.argmin(max_sim))
+            if max_sim[furthest] > cohesion_threshold:
+                break
+            seeds.append(X[furthest].copy())
+
+        centroids = np.array(seeds, dtype=np.float32)
+        num_branches = len(centroids)
+
+        # 2. stop early if the leaf is one cohesive community
+        if num_branches == 1:
+            # one cohesive community: raise the capacity and keep going
+            bloated_node.max_connections = min(
+                bloated_node.max_connections + pipeline_ref.max_connections, 64
+            )
+            self.max_leaf_capacity += 100
+            # Ideally we'd also raise the engine-side graph's M here, but the engine can't upgrade M
+            # in place, so the larger Python-side capacity check is the only guard.
+            return
+
+        # 3. variance-adaptive Hopfield convergence
+        lambda_scale = 5.0
+        for _ in range(15):
+            prev = centroids.copy()
+            scores = X @ centroids.T                              # (N, K)
+            variances = np.var(scores, axis=0)                    # (K,)
+            betas = lambda_scale / (variances + 1e-5)
+            scaled = scores * betas
+            shifted = scaled - np.max(scaled, axis=1, keepdims=True)
+            exp_s = np.exp(shifted)
+            weights = exp_s / (exp_s.sum(axis=1, keepdims=True) + 1e-9)
+            centroids = weights.T @ X                             # (K, D)
+            norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+            centroids /= norms + 1e-9
+            if np.allclose(centroids, prev, atol=1e-6):
+                break
+
+        sims = X @ centroids.T
+        max_sims = np.max(sims, axis=1)
 
         # 4. wire up the new subtree
 
@@ -349,7 +325,7 @@ class DisjointFamily(BaseNode):
             new_leaves.append(leaf)
         # insert chunks in their original order per community, so the NSW graph builds the same way
         # it would during live ingestion
-
+        assignments = np.argmax(sims, axis=1)
 
         community_chunks: List[List] = [[] for _ in range(num_branches)]
         for i, chunk in enumerate(active_chunks):
@@ -385,18 +361,6 @@ class DisjointFamily(BaseNode):
             self.node_id, child_id, new_branch.centroid_vector
         )
         pipeline_ref.node_registry[child_id] = new_branch
-
-        # free memory before recursing
-        del X
-        del X_list
-        del active_chunks
-        del community_chunks
-        if 'sims' in locals():
-            del sims
-        if 'assignments' in locals():
-            del assignments
-        import gc
-        gc.collect()
 
         # recurse: if a sub-leaf is still over capacity after redistribution, split it again, so the
         # tree can grow deeper than two levels
