@@ -1,47 +1,54 @@
 # Research notes: deep vs flat trees
 
-The goal is to split the embedding space into stable attractor basins and route to them in
-O(log N). The MS MARCO 100k runs make the trade-off clear: memory, latency and recall, and so far
-I can only get two of the three.
+What I've learned so far from the MS MARCO 100k runs about build time, memory, latency and
+recall: what worked, what didn't, and where I want to take it.
 
-## Flat tree (macro trunks only)
+My notes after the last run:
 
-* 4 trunks of ~25,000 vectors each
-* boundary duplication: 4.8%
-* recall@10: 86.5%
-* latency: 0.79 ms
-* build: 9.68 s
+> I'm not sure these results are what I want. There is a triangular trade-off between memory,
+> latency and recall, and we can optimise one or two at the cost of the rest. To improve all
+> three we need a better splitting algorithm. My issue is "Total chunks tracked in tree: 146732",
+> that's 46% copying, and going down to 1.02 leaves/query dropped recall from 98 to 88, which is
+> just the maths. What I expected from this run was less copying, a deeper tree, still fewer
+> leaves per query, and high recall. That was the whole point of the ideas from those papers.
 
-Fast to build and fast to query, because there's only one routing level. But each leaf graph is
-big and has to do most of the work, and recall stays around 86-88% unless I duplicate a lot more
-across the boundaries.
+## What failed: deep trees
 
-## Deep tree (recursive top-k splitting)
+I expected a deep recursive Hopfield tree (4+ levels) to give O(log N) queries. With the current
+splitting it doesn't.
 
-* 4 trunks split recursively into 60 leaves
-* boundary duplication: 4.8% (gated at insert)
-* recall@10: 97.5%
-* latency: 1.75 ms
-* build: 80.25 s
+* **Boundaries.** At every split some vectors sit between two clusters. To avoid losing them I
+  duplicate them into both branches.
+* **Duplication compounds.** It happens again at every level. With 4 levels on 100k vectors the
+  tree ended up holding 462,460 vectors.
+* **Latency.** To keep recall the router had to visit lots of small leaves, 166 per query. That
+  many tiny graphs is mostly FFI and cache overhead: 4.16 ms against 0.71 ms for the flat tree.
+* **Strict routing.** Cutting `target_confidence` from 0.95 to 0.80 to bring latency down made
+  the router miss the right leaves, and recall fell from 98% to 31.5%.
 
-With a deeper tree and a wide search (`max_beam=8`, `target_confidence=0.999`) recall gets to
-97.5%. The cost is build time (the recursive Hopfield splitting is slow) and about 1 ms more
-latency, since the router evaluates several levels and boundaries.
+## What worked: a flat tree
 
-## What this says
+At 100k a flat tree is much better.
 
-Every extra level adds a chance of routing to the wrong branch at a boundary. To keep recall I
-have to either:
+* Two levels only: root, macro trunks, leaves.
+* Duplication happens once, so it stays at ~46%, which is acceptable for now.
+* Routing at the top is one step, and the leaves are large Rust HNSW graphs.
+* Result: 8 s build, 0.71 ms latency, 98.0% recall@10.
 
-1. duplicate more boundary vectors so the basins overlap (memory), or
-2. keep the tree flat or search a wider beam (latency).
+## Where I want to go
 
-The deep run is the best so far: 97.5% at 1.75 ms with only 4.8% duplication, by gating which
-branches a vector is inserted into (top-k) and using the adaptive softmax at query time.
+The flat tree is fine at 100k, but at 1M or 1B vectors it won't hold up, and that's the scale I
+actually care about. That means deep trees, which means solving the boundary problem.
 
-## Next
+1. **Sharper basins.** Spherical k-means leaves fuzzy boundaries. I want a clustering where each
+   vector clearly belongs to one cluster.
+2. **No duplication.** With clean boundaries there's nothing to copy, and memory goes back to the
+   minimum.
+3. **Learned routing.** Instead of distance to centroids, a small model at each node (a logistic
+   classifier or a small MLP) that predicts the right child, including for vectors near edges.
+4. **Choosing depth.** Some way to work out the right depth for a given N (1M vs 10M vs 1B) so
+   the tree doesn't over-nest.
+5. **Cheap levels.** Each level has to be close to O(1), so going deeper doesn't cost much.
 
-* Grow depth only where it's needed: split a leaf when its spread passes a threshold (like growing
-  neural gas), instead of fixing the depth up front.
-* Sharper basins, so vectors fall clearly into one branch and a deep tree can be searched without
-  a wide beam.
+If the basins are clean, a query can drop straight to one small leaf without checking the
+neighbours, and that's the O(log N) version: no copying, high recall, very low latency.
