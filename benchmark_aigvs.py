@@ -22,7 +22,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-from aigvs.pipeline import AIGVSPipeline
+from aigvs.pipeline import AIGVSPipeline, USE_DEEP_TREE
 
 SAMPLE_SIZE = 100000
 TEST_QUERIES = 200
@@ -204,7 +204,21 @@ def main():
         }
         
         t0 = time.perf_counter()
-        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, max_beam=15, target_confidence=0.99, beta=0.1, ef_search=300)
+        
+        if USE_DEEP_TREE:
+            # Deep tree requires wider search to find boundaries
+            _max_beam = 15
+            _target_conf = 0.999
+            _beta = 0.01
+            _ef = 300
+        else:
+            # Flat tree is fast and confident
+            _max_beam = 8
+            _target_conf = 0.95
+            _beta = 3.0
+            _ef = 100
+            
+        aigvs_results_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K, max_beam=_max_beam, target_confidence=_target_conf, beta=_beta, ef_search=_ef)
         aigvs_time = (time.perf_counter() - t0) * 1000
         aigvs_results = [item["id"] for item in aigvs_results_raw]
         aigvs_mrr = calculate_mrr(aigvs_results, golden_targets)

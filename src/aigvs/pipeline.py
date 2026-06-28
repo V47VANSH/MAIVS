@@ -11,7 +11,7 @@ import aigvs_rust
 
 # --- architecture toggle --- True: let the tree split recursively into deep leaves. False: keep it
 # flat (macro trunks only).
-USE_DEEP_TREE = True
+USE_DEEP_TREE = False
 # =====================================================================
 
 
