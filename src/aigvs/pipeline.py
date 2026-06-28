@@ -4,9 +4,9 @@ import time
 import numpy as np
 from collections import deque
 from typing import Dict, List, Optional
-from src.aigvs.core.models import TextChunk
-from src.aigvs.storage import LocalJSONStorage
-from src.aigvs.engine.nodes import DisjointFamily, BaseNode, JointFamily
+from aigvs.core.models import TextChunk
+from aigvs.storage import LocalJSONStorage
+from aigvs.engine.nodes import DisjointFamily, BaseNode, JointFamily
 import aigvs_rust
 
 
@@ -74,6 +74,8 @@ class AIGVSPipeline:
         self.engine.register_leaf(
             leaf_id,
             parent_id,
+            max_connections=self.max_connections,
+            ef_construction=self.ef_construction,
         )
 
     def _cache_payload(self, chunk: TextChunk) -> None:
@@ -202,7 +204,7 @@ class AIGVSPipeline:
         X = np.array(embeddings, dtype=np.float32)  # (N, D)
         N = len(chunks)
         print(f"[AIGVS] Converted dicts to chunks. N={N}", flush=True)
-
+        
         # small corpus: skip macro discovery and insert directly
         num_leaves_est = N / self.root.max_leaf_capacity
         if num_leaves_est < 4:
@@ -257,7 +259,7 @@ class AIGVSPipeline:
 
             # BATCH INSERT OPTIMIZATION (Bypass python loop & FFI overhead)
             new_leaf_id = f"{trunk_id}_leaf_0"
-            from src.aigvs.engine.nodes import JointFamily
+            from aigvs.engine.nodes import JointFamily
             new_leaf = JointFamily(
                 node_id=new_leaf_id,
                 parent_id=trunk_id,
@@ -362,7 +364,7 @@ class AIGVSPipeline:
         if norm > 0:
             query_embedding = query_embedding / norm
 
-        ef = ef_search if ef_search is not None else max(top_k * 8, 128)
+        ef = ef_search if ef_search is not None else max(top_k * 8, 100)
 
         # one PyO3 call: Rust does the routing and the parallel leaf search
         matched_ids: List[str] = self.engine.unified_search(

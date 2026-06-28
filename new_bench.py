@@ -101,7 +101,7 @@ def print_database_states(faiss_index, chroma_collection, aigvs_pipeline):
         print(f"HNSW Max Links (M):      {faiss_index.hnsw.nb_neighbors(0) if faiss_index.ntotal > 0 else 'N/A'}")
         print(f"Graph Storage Type:      HNSW Graph")
     else:
-        print(f"Graph Storage Type:      IVF-Flat")
+        print(f"Graph Storage Type:      Flat / Uncompressed vectors (Fallback mode)")
     print("-" * 30)
 
     # --- 2. chroma ---
@@ -194,22 +194,17 @@ def main():
     faiss_vectors = np.ascontiguousarray(doc_embeddings.copy(), dtype=np.float32)
     faiss.normalize_L2(faiss_vectors)
     
-    print("BREADCRUMB 2: Initializing FAISS Index (IVF-Flat)...", flush=True)
-    start_time = time.time()
+    print("BREADCRUMB 2: Initializing FAISS Index (HNSW)...", flush=True)
     faiss.omp_set_num_threads(1)
-    nlist = 4
-    quantizer = faiss.IndexFlatIP(EMBEDDING_DIM)
-    faiss_index = faiss.IndexIVFFlat(quantizer, EMBEDDING_DIM, nlist, faiss.METRIC_INNER_PRODUCT)
-    print("BREADCRUMB 2.5: Training FAISS Index...", flush=True)
-    faiss_index.train(faiss_vectors)
-    faiss_index.nprobe = 4
+    faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIM, 32)
+    faiss_index.hnsw.efConstruction = 200
+    faiss_index.hnsw.efSearch = 128
     
     print("BREADCRUMB 3: Adding vectors to FAISS...", flush=True)
+    start_time = time.time()
     faiss_index.add(faiss_vectors)
-    
-    faiss_id_map = {i: doc_ids[i] for i in range(len(docs))}
-    
     paper_metrics["global_performance"]["faiss"]["build_time_sec"] = time.time() - start_time
+    faiss_id_map = {i: doc_ids[i] for i in range(len(docs))}
     print("BREADCRUMB 4: FAISS survived!", flush=True)
     
     del faiss_vectors

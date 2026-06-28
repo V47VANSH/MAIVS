@@ -162,16 +162,16 @@ def main():
     
     print("\n[4/6] STARTING THE WRITE RACE...")
     
-    # --- AIGVS (rust) ---
-    import gc
-    gc.collect()
-    mem_before_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-
     # Normalize vectors for AIGVS
     aigvs_vectors = np.ascontiguousarray(doc_embeddings.copy(), dtype=np.float32)
     norms = np.linalg.norm(aigvs_vectors, axis=1, keepdims=True)
     norms[norms == 0] = 1
     aigvs_vectors = aigvs_vectors / norms
+
+    # --- AIGVS (rust) ---
+    import gc
+    gc.collect()
+    mem_before_aigvs = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     
     aigvs_payload = [
         {"id": doc_ids[i], "text": doc_texts[i], "embedding": aigvs_vectors[i].copy()} 
