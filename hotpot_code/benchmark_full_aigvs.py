@@ -17,13 +17,25 @@ import pyarrow
 import pyarrow.dataset
 
 import json
+import psutil
+import gc
+import concurrent.futures
 import time
 import numpy as np
-import psutil
 from tqdm import tqdm
 import faiss
 from sentence_transformers import SentenceTransformer
-import gc
+
+def background_generator(generator):
+    """Overlaps disk I/O (JSON parsing) with CPU indexing by prefetching the next chunk in a background thread."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(next, generator, None)
+        while future is not None:
+            result = future.result()
+            if result is None:
+                break
+            future = executor.submit(next, generator, None)
+            yield result
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
@@ -47,6 +59,9 @@ def calc_ndcg(results, golden_targets, k=10):
     return dcg / idcg if idcg > 0 else 0.0
 
 def yield_all_vectors_and_ids(total_chunks, load_text=False):
+    batch_size = 4
+    accum_vectors, accum_ids, accum_texts = [], [], []
+    
     for chunk_idx in range(total_chunks):
         npy_path = os.path.join(DATA_DIR, f"embeddings_chunk_{chunk_idx}.npy")
         txt_path = os.path.join(DATA_DIR, f"corpus_chunk_{chunk_idx}.jsonl")
@@ -63,7 +78,16 @@ def yield_all_vectors_and_ids(total_chunks, load_text=False):
                 if load_text:
                     texts.append(data["text"])
                     
-        yield vectors, ids, texts
+        accum_vectors.append(vectors)
+        accum_ids.extend(ids)
+        accum_texts.extend(texts)
+        
+        if len(accum_vectors) >= batch_size:
+            yield np.vstack(accum_vectors), accum_ids, accum_texts
+            accum_vectors, accum_ids, accum_texts = [], [], []
+            
+    if accum_vectors:
+        yield np.vstack(accum_vectors), accum_ids, accum_texts
 
 def ensure_corpus_jsonl(total_chunks):
     chunk_size = 100000
@@ -109,26 +133,24 @@ def main():
     print("Loading model...")
     model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
     
-    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM)
+    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=16)
     aigvs_pipeline.storage = InMemoryStorage()
     
     print("Ingesting chunks to AIGVS...")
     start_time = time.time()
     mem_before = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     
-    all_payloads = []
-    for vectors, ids, texts in tqdm(yield_all_vectors_and_ids(total_chunks, load_text=False), total=total_chunks, desc="Loading chunks to RAM"):
+    gen = yield_all_vectors_and_ids(total_chunks, load_text=True)
+    prefetch_gen = background_generator(gen)
+    
+    expected_batches = (total_chunks + 3) // 4
+    for vectors, ids, texts in tqdm(prefetch_gen, total=expected_batches, desc="Ingesting 400k batches to AIGVS"):
         chunk_vecs = np.array(vectors, copy=True, dtype=np.float32)
         chunk_vecs = np.ascontiguousarray(chunk_vecs)
         faiss.normalize_L2(chunk_vecs) 
-        
-        payload = [{"id": ids[idx], "text": texts[idx] if texts else "", "embedding": chunk_vecs[idx]} for idx in range(len(ids))]
-        all_payloads.extend(payload)
-        
-    print(f"Executing single-shot global ingestion of {len(all_payloads)} vectors to AIGVS...")
-    aigvs_pipeline.ingest_hierarchical_json(all_payloads)
-    del all_payloads
-    gc.collect()
+        aigvs_pipeline.bulk_ingest_arrays(ids, texts, chunk_vecs)
+        del chunk_vecs
+        gc.collect()
         
     build_time_sec = time.time() - start_time
     memory_mb = (psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024) - mem_before
@@ -143,7 +165,7 @@ def main():
         golden = q["golden_targets"]
         
         t0 = time.perf_counter()
-        res_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K_DEEP)
+        res_raw = aigvs_pipeline.query(q_vec_norm, top_k=TOP_K_DEEP, target_confidence=0.90, beta=10.0, max_beam=15)
         latency = (time.perf_counter() - t0) * 1000
         
         results = [item["id"] for item in res_raw]
