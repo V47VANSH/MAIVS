@@ -115,15 +115,34 @@ def print_database_states(faiss_index, chroma_collection, aigvs_pipeline):
 
     # --- 3. AIGVS (rust) ---
     print(">>> [AIGVS Rust System State]")
-    stats = aigvs_pipeline.stats()
-    print(f"Top-Level Trunks/Attractors: {stats.get('trunks', 0)}")
-    print(f"Total Leaves:                {stats.get('leaves', 0)}")
-    print(f"Max Tree Depth:              {stats.get('max_depth', 0)}")
-    print(f"Total Nodes (Trunks+Leaves): {stats.get('total_nodes', 0)}")
-    print(f"Total Routers:               {stats.get('routers', 0)}")
-    print(f"Total HNSW Graphs:           {stats.get('graphs', 0)}")
-    print(f"Total Indexed Vectors:       {stats.get('total_indexed_vectors', 0)}")
+    root_node = aigvs_pipeline.root
+    active_attractors = len(root_node.children)
+    print(f"Top-Level Trunks/Attractors: {active_attractors}")
     
+    print("Node Distribution Profile:")
+    total_chunks_found = 0
+    
+    def count_chunks_in_tree(node):
+        if hasattr(node, 'children') and node.children:
+            total = 0
+            for child in node.children.values():
+                total += count_chunks_in_tree(child)
+            return total
+        else:
+            if hasattr(node, '_count'):
+                return node._count
+            elif hasattr(node, 'chunk_ids'):
+                return len(node.chunk_ids)
+            return 0
+
+    for idx, (child_id, child_node) in enumerate(root_node.children.items()):
+        true_capacity = count_chunks_in_tree(child_node)
+        total_chunks_found += true_capacity
+        
+        node_type = "Branch" if hasattr(child_node, 'children') else "Leaf"
+        print(f"  - {node_type} [{child_id[-8:]}]: Contains {true_capacity} chunks deep")
+        
+    print(f"Total Chunks Tracked in Tree:  {total_chunks_found}")
     print("==============================================\n")
 
 def main():
@@ -240,7 +259,7 @@ def main():
     ]
     print("\nBREADCRUMB 8: Initializing AIGVS Rust System...", flush=True)
     
-    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM)
+    aigvs_pipeline = AIGVSPipeline(embedding_dim=EMBEDDING_DIM, ef_construction=32, max_connections=64)
     from aigvs.storage import InMemoryStorage
     aigvs_pipeline.storage = InMemoryStorage()
     
