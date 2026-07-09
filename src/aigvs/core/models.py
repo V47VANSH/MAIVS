@@ -6,15 +6,15 @@ class TextChunk:
     def __init__(self, chunk_id: str, text: str, embedding: np.ndarray, metadata: Optional[Dict] = None):
         self.chunk_id = chunk_id
         self.text = text
-        # Enforce float32 for fast matrix operations
-        self.embedding = embedding.astype(np.float32)
+        # Enforce float32 for fast matrix operations if embedding is provided
+        self.embedding = embedding.astype(np.float32) if embedding is not None else None
         self.metadata = metadata or {}
 
     def to_dict(self) -> Dict:
         return {
             "chunk_id": self.chunk_id,
             "text": self.text,
-            "embedding": self.embedding.tolist(),
+            "embedding": self.embedding.tolist() if self.embedding is not None else None,
             "metadata": self.metadata
         }
 
@@ -23,6 +23,6 @@ class TextChunk:
         return cls(
             chunk_id=data["chunk_id"],
             text=data["text"],
-            embedding=np.array(data["embedding"], dtype=np.float32),
-            metadata=data["metadata"]
+            embedding=np.array(data["embedding"], dtype=np.float32) if data.get("embedding") is not None else None,
+            metadata=data.get("metadata", {})
         )

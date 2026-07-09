@@ -116,13 +116,19 @@ def main():
     start_time = time.time()
     mem_before = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     
-    for vectors, ids, texts in tqdm(yield_all_vectors_and_ids(total_chunks, load_text=True), total=total_chunks, desc="Ingesting chunks to AIGVS"):
+    all_payloads = []
+    for vectors, ids, texts in tqdm(yield_all_vectors_and_ids(total_chunks, load_text=False), total=total_chunks, desc="Loading chunks to RAM"):
         chunk_vecs = np.array(vectors, copy=True, dtype=np.float32)
         chunk_vecs = np.ascontiguousarray(chunk_vecs)
         faiss.normalize_L2(chunk_vecs) 
-        payload = [{"id": ids[idx], "text": texts[idx], "embedding": chunk_vecs[idx]} for idx in range(len(ids))]
-        aigvs_pipeline.ingest_batches(payload)
-        del chunk_vecs, payload
+        
+        payload = [{"id": ids[idx], "text": texts[idx] if texts else "", "embedding": chunk_vecs[idx]} for idx in range(len(ids))]
+        all_payloads.extend(payload)
+        
+    print(f"Executing single-shot global ingestion of {len(all_payloads)} vectors to AIGVS...")
+    aigvs_pipeline.ingest_hierarchical_json(all_payloads)
+    del all_payloads
+    gc.collect()
         
     build_time_sec = time.time() - start_time
     memory_mb = (psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024) - mem_before
