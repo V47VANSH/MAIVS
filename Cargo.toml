@@ -7,9 +7,16 @@ edition = "2021"
 name = "aigvs_rust"
 crate-type = ["cdylib"]
 
+# fat LTO + one codegen unit, otherwise the SIMD kernels don't inline across
+# modules. Keep panic = "unwind" so pyo3 can turn panics into Python exceptions.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
-pyo3 = { version = "0.21", features = ["extension-module"] }
-numpy = "0.21"
+# pyo3 0.21 only supports up to CPython 3.12, and I'm on 3.13
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
 ndarray = { version = "0.15", features = ["rayon"] }
 rayon = "1.8"
 parking_lot = "0.12"

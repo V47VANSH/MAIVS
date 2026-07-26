@@ -1,0 +1,8 @@
+# target-cpu=native so the SIMD kernels get AVX2 (without it rustc targets
+# baseline x86-64, i.e. SSE2).
+#
+# Binaries built this way won't run on older CPUs. For a portable build use e.g.
+#   rustflags = ["-C", "target-cpu=x86-64-v3"]   # AVX2
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

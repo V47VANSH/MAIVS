@@ -1,3 +1,9 @@
+mod centroid_index;
+mod index_v2;
+mod maintain;
+mod persist;
+mod rabitq;
+
 use pyo3::prelude::*;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use rayon::prelude::*;
@@ -746,7 +752,8 @@ impl AIGVSEngine {
 // --- NSW insert helpers ---
 
 #[pymodule]
-fn aigvs_rust(_py: Python, m: &PyModule) -> PyResult<()> {
+fn aigvs_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AIGVSEngine>()?;
+    m.add_class::<index_v2::FlatCellIndex>()?;
     Ok(())
 }
