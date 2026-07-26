@@ -3,11 +3,13 @@ from typing import Dict, Optional
 
 class TextChunk:
     """The granular unit of text and vector data stored inside the AIGVS ecosystem."""
-    def __init__(self, chunk_id: str, text: str, embedding: np.ndarray, metadata: Optional[Dict] = None):
+    def __init__(self, chunk_id: str, text: str, embedding: Optional[np.ndarray], metadata: Optional[Dict] = None):
         self.chunk_id = chunk_id
         self.text = text
-        # Enforce float32 for fast matrix operations
-        self.embedding = embedding.astype(np.float32)
+        # float32 for fast matrix ops. embedding is None once the pipeline has handed the vector to
+        # the Rust engine (see AIGVSPipeline._recursive_bulk_build), and for chunks read back from a
+        # storage adapter that doesn't keep vectors.
+        self.embedding = None if embedding is None else embedding.astype(np.float32)
         self.metadata = metadata or {}
 
     def to_dict(self) -> Dict:
