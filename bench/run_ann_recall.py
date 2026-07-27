@@ -250,7 +250,10 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
              per_dim_sq: bool = False,
              adaptive: bool = False,
              at_margin: float = 0.02, code_bits: int = 0, graph_min: int = 0,
-             two_stage: bool = False) -> None:
+             two_stage: bool = False, compact: bool = True,
+             shortlist_mult: int = 4,
+             tree_route: bool = False, tree_min: int = 2048,
+             tree_fanout: int = 16) -> None:
     """The flat-cell index.
 
     scan_mode="f32" is exact inside each scanned cell, so any recall loss is routing loss.
@@ -296,7 +299,12 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
     if adaptive:
         ix.set_adaptive(True, at_margin)
     if two_stage:
-        ix.set_two_stage(True, 4)
+        ix.set_two_stage(True, shortlist_mult)
+    # Tree routing has to be set before add_batch: the tree also routes ingestion, which is what
+    # takes placement off the O(N*M) path. Leaving it off cost this harness ~6x on build (76 s vs 12
+    # s at 1M), and meant the routing we actually ship wasn't the one being benchmarked.
+    if tree_route:
+        ix.set_tree_route(True, tree_min, tree_fanout)
     # Graph routing turns itself on past MIN_CELLS_FOR_GRAPH (4096). Forcing it on below that caps
     # recall at high nprobe, because a greedy traversal can't reliably reach every cell, which is
     # what nprobe=n_cells asks for. --graph-min overrides it for small-cell experiments.
@@ -308,6 +316,11 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
     for s in range(0, len(base), chunk):
         e = min(s + chunk, len(base))
         ix.add_batch(ids[s:e].tolist(), np.ascontiguousarray(base[s:e]))
+    # Cluster-major layout: slots are handed out in insertion order, so a cell's members end up
+    # scattered and the scan becomes a random gather. compact() makes each cell one contiguous run.
+    # Counted as part of the build.
+    if compact:
+        ix.compact()
     build_s = time.perf_counter() - t0
     mem = _rss_mb() - m0
 
@@ -319,7 +332,19 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
           f"arena={st['arena_bytes_per_vec']:.0f} B/vec")
 
     qc = np.ascontiguousarray(queries)
-    probe_grid = (8, 16, 32, 64, 128, 256, n_cells) if adaptive else (1, 4, 8, 16, 32, 64, 128)
+    if adaptive:
+        # The old grid jumped from 256 straight to n_cells, which skipped the whole high-recall
+        # range (at 1M, everything between R@10 0.98 and the exhaustive 0.994). That's the range
+        # where the faiss comparison is decided.
+        probe_grid = tuple(p for p in
+                           (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+                           if p < n_cells) + (n_cells,)
+    elif n_cells > 2000:
+        # Smaller cells need more probes for the same recall; compare vectors scanned (nprobe *
+        # cell_size), not nprobe.
+        probe_grid = (8, 16, 32, 64, 128, 256, 512)
+    else:
+        probe_grid = (1, 4, 8, 16, 32, 64, 128)
     for nprobe in probe_grid:
         ret, lat = _timed_queries(
             lambda q: ix.search(q, k, nprobe, 1.0, 8.0)[0], queries, k)
@@ -428,6 +453,13 @@ def main() -> None:
                    help="spill margin: replicate only within this cosine gap")
     p.add_argument("--rerank", type=int, default=4,
                    help="candidate multiplier for quantized scan modes")
+    p.add_argument("--no-compact", action="store_true",
+                   help="skip cluster-major arena compaction (A/B the layout)")
+    p.add_argument("--tree", action="store_true",
+                   help="hierarchical routing; also routes ingestion, which "
+                        "is what takes build off the O(N*M) assignment path")
+    p.add_argument("--tree-min", type=int, default=2048)
+    p.add_argument("--tree-fanout", type=int, default=16)
     p.add_argument("--cells", type=int, default=0,
                    help="partition count for v2; 0 = sqrt(N)")
     args = p.parse_args()
@@ -452,8 +484,10 @@ def main() -> None:
                  spill_margin=args.margin, i8_rerank=args.i8_rerank,
                  adaptive=args.adaptive, at_margin=args.at_margin,
                  code_bits=args.code_bits, two_stage=args.two_stage,
-                 graph_min=args.graph_min,
-                 f16_rerank=args.f16_rerank, per_dim_sq=args.per_dim_sq)
+                 graph_min=args.graph_min, compact=not args.no_compact,
+                 f16_rerank=args.f16_rerank, per_dim_sq=args.per_dim_sq,
+                 tree_route=args.tree, tree_min=args.tree_min,
+                 tree_fanout=args.tree_fanout)
     if "aigvs" in want:
         bench_aigvs(base, queries, gt_ids, args.k, rows)
     if "faiss-hnsw" in want:

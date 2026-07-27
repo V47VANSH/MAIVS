@@ -230,3 +230,8 @@ ingest.py
 query.py
 run_aigvs.py
 stress_test.py
+
+# benchmark data and caches (large, can be regenerated)
+hotpot_1M.npy
+bench/_lab_cache/
+bench/_gt_cache/
