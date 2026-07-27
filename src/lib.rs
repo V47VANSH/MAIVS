@@ -1,5 +1,6 @@
 mod centroid_index;
 mod centroid_tree;
+mod concurrent;
 mod index_v2;
 mod maintain;
 mod persist;
@@ -756,5 +757,6 @@ impl AIGVSEngine {
 fn aigvs_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AIGVSEngine>()?;
     m.add_class::<index_v2::FlatCellIndex>()?;
+    m.add_class::<concurrent::ConcurrentIndex>()?;
     Ok(())
 }
