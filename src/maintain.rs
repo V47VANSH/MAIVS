@@ -196,7 +196,36 @@ pub(crate) fn maintain(
         splits += 1;
     }
 
-    // --- merge undersized cells ---
+    // --- merge undersized cells --- Finding the nearest surviving cell by scanning every other
+    // cell makes this O(M^2) full-dimension dots. That didn't show at ~1000 cells, but with
+    // 128-vector cells at 1M (~7800 cells) it's ~61M dots per pass and grows quadratically.
+    //
+    // So build one graph over the live centroids and query it instead. Candidates are re-checked
+    // against live membership, and anything the graph misses falls back to the exact scan, so the
+    // result is the same, just faster.
+    let n_under = ix
+        .cells
+        .iter()
+        .filter(|c| !c.members.is_empty() && c.members.len() < lo.max(1))
+        .count();
+    let mut merge_graph = None;
+    let mut merge_ids: Vec<u32> = Vec::new();
+    if n_under > 0 && ix.cells.len() > 1024 {
+        let live: Vec<usize> = (0..ix.cells.len())
+            .filter(|&i| !ix.cells[i].members.is_empty())
+            .collect();
+        if live.len() > 1 {
+            let mut flat = Vec::with_capacity(live.len() * dim);
+            for &i in &live {
+                flat.extend_from_slice(&ix.cells[i].centroid);
+            }
+            merge_graph = Some(crate::centroid_index::build_from_cells(&flat, dim));
+            merge_ids = live.iter().map(|&i| i as u32).collect();
+        }
+    }
+    let mut gvis: Vec<u32> = Vec::new();
+    let mut gstamp: u32 = 0;
+
     for ci in 0..ix.cells.len() {
         let n = ix.cells[ci].members.len();
         if n == 0 || n >= lo.max(1) {
@@ -205,19 +234,39 @@ pub(crate) fn maintain(
         // Nearest non-trivial neighbour by centroid cosine.
         let mut best = usize::MAX;
         let mut best_s = f32::NEG_INFINITY;
-        for cj in 0..ix.cells.len() {
-            if cj == ci || ix.cells[cj].members.is_empty() {
-                continue;
+
+        if let Some(g) = merge_graph.as_ref() {
+            gstamp = gstamp.wrapping_add(1).max(1);
+            let q = ix.cells[ci].centroid.clone();
+            for (node, _) in g.search(&q, None, 16, 64, &mut gvis, gstamp) {
+                let cj = merge_ids[node as usize] as usize;
+                if cj == ci || ix.cells[cj].members.is_empty() {
+                    continue;
+                }
+                let s: f32 = q.iter().zip(ix.cells[cj].centroid.iter())
+                    .map(|(a, b)| a * b).sum();
+                if s > best_s {
+                    best_s = s;
+                    best = cj;
+                }
             }
-            let s: f32 = ix.cells[ci]
-                .centroid
-                .iter()
-                .zip(ix.cells[cj].centroid.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            if s > best_s {
-                best_s = s;
-                best = cj;
+        }
+        // No graph, or every candidate it returned has since been merged away.
+        if best == usize::MAX {
+            for cj in 0..ix.cells.len() {
+                if cj == ci || ix.cells[cj].members.is_empty() {
+                    continue;
+                }
+                let s: f32 = ix.cells[ci]
+                    .centroid
+                    .iter()
+                    .zip(ix.cells[cj].centroid.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                if s > best_s {
+                    best_s = s;
+                    best = cj;
+                }
             }
         }
         if best == usize::MAX {

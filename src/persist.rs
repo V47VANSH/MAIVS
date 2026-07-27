@@ -83,7 +83,7 @@ pub(crate) fn save_index(ix: &FlatCellIndex, path: &str) -> PyResult<()> {
 
     let mut go = || -> std::io::Result<()> {
         w.write_all(MAGIC)?;
-        let hdr: [u64; 13] = [
+        let hdr: [u64; 16] = [
             ix.dim as u64,
             match ix.scan_mode {
                 ScanMode::F32 => 0,
@@ -101,6 +101,11 @@ pub(crate) fn save_index(ix: &FlatCellIndex, path: &str) -> PyResult<()> {
             ix.keep_f32 as u64,
             ix.adaptive as u64,
             ix.two_stage as u64,
+            // Routing settings can't be recomputed from the data; without them a reloaded index
+            // falls back to the defaults and routes differently from the saved one.
+            ix.tree_route as u64,
+            ix.tree_min_cells as u64,
+            ix.tree_fanout as u64,
         ];
         for v in hdr {
             wr_u64(&mut w, v)?;
@@ -108,6 +113,7 @@ pub(crate) fn save_index(ix: &FlatCellIndex, path: &str) -> PyResult<()> {
         wr_f32(&mut w, ix.quant_scale)?;
         wr_f32(&mut w, ix.spill_margin)?;
         wr_f32(&mut w, ix.at_margin)?;
+        wr_f32(&mut w, ix.tree_beam_frac)?;
 
         wr_pod(&mut w, &ix.bits)?;
         wr_pod(&mut w, &ix.scan_i8)?;
@@ -119,6 +125,9 @@ pub(crate) fn save_index(ix: &FlatCellIndex, path: &str) -> PyResult<()> {
         wr_pod(&mut w, &ix.slot_cell)?;
         wr_pod(&mut w, &ix.free_slots)?;
         wr_pod(&mut w, &ix.slot_cells)?;
+        // Filter tags travel with the index; without them a reloaded index
+        // silently answers every filtered query as if unfiltered.
+        wr_pod(&mut w, &ix.tags)?;
 
         wr_u64(&mut w, ix.cells.len() as u64)?;
         for c in &ix.cells {
@@ -146,13 +155,14 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
         ));
     }
 
-    let mut h = [0u64; 13];
+    let mut h = [0u64; 16];
     for slot in h.iter_mut() {
         *slot = rd_u64(&mut r).map_err(io_err)?;
     }
     let quant_scale = rd_f32(&mut r).map_err(io_err)?;
     let spill_margin = rd_f32(&mut r).map_err(io_err)?;
     let at_margin = rd_f32(&mut r).map_err(io_err)?;
+    let tree_beam_frac = rd_f32(&mut r).map_err(io_err)?;
 
     let dim_pad = h[3] as usize;
     let seed = h[5];
@@ -169,6 +179,7 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
     let slot_cell: Vec<u32> = rd_pod(&mut r).map_err(io_err)?;
     let free_slots: Vec<u32> = rd_pod(&mut r).map_err(io_err)?;
     let slot_cells: Vec<u32> = rd_pod(&mut r).map_err(io_err)?;
+    let tags: Vec<u32> = rd_pod(&mut r).map_err(io_err)?;
 
     let ncell = rd_u64(&mut r).map_err(io_err)? as usize;
     let mut cells = Vec::with_capacity(ncell);
@@ -217,7 +228,26 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
         graph_ids: Vec::new(),
         graph_route: true,
         graph_min_cells: crate::centroid_index::MIN_CELLS_FOR_GRAPH,
+        // derived state: rebuilt by finish_load(), not written to disk (the tree only depends on
+        // the centroids)
+        tags,
+        tag_filter: None,
+        cent_tree: None,
+        tree_route: h[13] != 0,
+        tree_min_cells: h[14] as usize,
+        tree_fanout: h[15] as usize,
+        tree_beam_frac,
+        tree_cells: 0,
+        par_scan: false,
         two_stage: h[12] != 0,
+        // Derived, like the centroid codes and the tree: rebuilt by finish_load instead of stored,
+        // so the file format doesn't change. The flag itself isn't saved because f32 and SQ8
+        // re-order gave the same probe counts and scans on two corpora, so a loaded index returns
+        // the same rows either way (which is what the save/load test checks).
+        cent_sq8: Vec::new(),
+        csq_min: Vec::new(),
+        csq_step: Vec::new(),
+        centroid_sq8: true,
         shortlist_mult: h[8] as usize,
         quant_scale,
         n_live: h[6] as usize,

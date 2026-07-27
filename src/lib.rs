@@ -1,4 +1,5 @@
 mod centroid_index;
+mod centroid_tree;
 mod index_v2;
 mod maintain;
 mod persist;
