@@ -19,9 +19,8 @@ Most of the other properties follow from that: O(1) delete (no edges to repair),
 (a linear scan can just skip), easy to split into segments for concurrency (cells don't reference
 each other), and a query cost you can work out in advance as bytes.
 
-The old engine (`AIGVSEngine` in `src/lib.rs` and the Python pipeline in `src/aigvs/`) is the
-Hopfield router + NSW leaf design. It's retired and only still here because `benchmark_aigvs.py`
-and a few old scripts import it. Everything current is `FlatCellIndex`.
+The original engine (Hopfield router + NSW leaves) has been removed from `src/`; it's in the git
+history. Everything current is `FlatCellIndex`.
 
 ## 2. Files
 
@@ -29,24 +28,24 @@ and a few old scripts import it. Everything current is `FlatCellIndex`.
 
 | File | Lines | What |
 |---|---|---|
-| `index_v2.rs` | ~2,500 | the engine. `FlatCellIndex`: arena, cells, scan kernels, routing, rerank, delete, compaction, filters, ingest |
-| `centroid_tree.rs` | ~600 | dynamic-depth tree over the cell centroids, spherical and hierarchical k-means. Routes queries at scale and ingest at every scale |
-| `centroid_index.rs` | ~360 | HNSW over centroids. Not used in practice: 2x slower than a flat scan at 7,804 nodes, so its threshold is 65,536. Kept for the untested range above that |
+| `index.rs` | ~2,500 | the engine. `FlatCellIndex`: arena, cells, scan kernels, routing, rerank, delete, compaction, filters, ingest |
+| `tree.rs` | ~600 | dynamic-depth tree over the cell centroids, spherical and hierarchical k-means. Routes queries at scale and ingest at every scale |
+| `graph.rs` | ~360 | HNSW over centroids. Not used in practice: 2x slower than a flat scan at 7,804 nodes, so its threshold is 65,536. Kept for the untested range above that |
 | `maintain.rs` | ~320 | online split/merge (spherical 2-means split, merge into the nearest centroid) |
-| `rabitq.rs` | ~230 | fast Hadamard rotation, 1-bit packing, POPCNT Hamming |
+| `quantize.rs` | ~230 | fast Hadamard rotation, 1-bit packing, POPCNT Hamming |
 | `persist.rs` | ~270 | little-endian save/load; derived state is rebuilt, not stored |
 | `concurrent.rs` | ~380 | `ConcurrentIndex`: immutable segments, a mutable head, snapshot reads |
-| `lib.rs` | ~800 | the old `AIGVSEngine`, plus pyo3 registration |
+| `lib.rs` | ~40 | module list and pyo3 registration |
 
 ### Python (`bench/`, `tests/`)
 
 | File | What |
 |---|---|
 | `bench/groundtruth.py` | exact k-NN ground truth, streamed, cached in `bench/_gt_cache/`. All recall numbers come from this |
-| `bench/run_ann_recall.py` | main benchmark: recall vs QPS for this index and 5 faiss configs |
-| `bench/run_churn.py` | churn benchmark (still on an older config, see section 7) |
-| `bench/routability_study.py`, `summariser_lab.py`, `ab_centroid_sq8.py`, `scan_cascade.py` | one-off studies |
-| `tests/test_index_v2.py` | 30 invariant checks, run after every change |
+| `bench/bench_recall.py` | main benchmark: recall vs QPS for this index and 5 faiss configs |
+| `bench/bench_churn.py` | churn benchmark |
+| `bench/research/` | one-off studies (routability, summaries, centroid SQ8 A/B, scan cascade) |
+| `tests/test_index.py` | 30 invariant checks, run after every change |
 
 ## 3. Architecture
 
@@ -68,7 +67,7 @@ A slot is an index into all of these arrays at once. A cell holds u32 slot numbe
 After `compact()` each cell's slots are contiguous and ascending, so scanning a cell is one
 sequential read. That alone was worth 3.0x, the biggest single win so far.
 
-### Query path: `FlatCellIndex::search_one` (`index_v2.rs`)
+### Query path: `FlatCellIndex::search_one` (`index.rs`)
 
 ```text
  1. ROUTE     pick nprobe cells, first of these that exists:
@@ -111,7 +110,7 @@ Routing ingest through the tree took a 1M ingest from 96.5 s to 11.0 s.
 independent of index size. Recall doesn't decay (-0.0046 over 100% turnover), but locality does;
 see `compact()`.
 
-### The tree: `centroid_tree.rs`
+### The tree: `tree.rs`
 
 Built bottom-up: cluster level L by `fanout` to get level L-1, stop once the top fits in `TOP_MAX`
 (256) nodes. Depth is derived, never set:
@@ -149,14 +148,14 @@ inserts); tombstones in sealed segments are never reclaimed; no save/load; no se
 
 ## 4. Tunables and where they came from
 
-### `index_v2.rs`
+### `index.rs`
 
 | Constant | Value | Why |
 |---|---|---|
 | `TARGET_CELL_SIZE` | 128 | best of {128, 256, 512, 1024} at 999k on both the scan growth exponent (0.21 vs 0.23-0.46) and absolute scan at R@10 0.99 (3.3x better than 1024). This sets the complexity |
 | `ASSIGN_CANDIDATES` | 64 | larger than a query beam on purpose: a badly probed query loses one result, a badly placed vector is wrong until it's deleted. All candidates are rescored exactly |
 
-### `centroid_tree.rs`
+### `tree.rs`
 
 | Constant | Value | Why |
 |---|---|---|
@@ -166,7 +165,7 @@ inserts); tombstones in sealed segments are never reclaimed; no save/load; no se
 | `DEFAULT_BEAM_FRAC` | 0.5 | swept at 999k: at np=512, 823 (0.25) -> 883 (0.50) -> 893 (0.75) qps, and recall went up too |
 | `MIN_CELLS_FOR_TREE` | 2048 | below this a flat centroid scan wins. The caller's `tree_min_cells` decides, not this constant |
 
-### `centroid_index.rs`
+### `graph.rs`
 
 | Constant | Value | Why |
 |---|---|---|
@@ -201,7 +200,7 @@ cp target/release/aigvs_rust.dll aigvs_rust.pyd     # .so on Linux/macOS
 After every build:
 
 ```bash
-KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index_v2.py    # 30 checks
+KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index.py    # 30 checks
 ```
 
 `KMP_DUPLICATE_LIB_OK=TRUE` because faiss and torch ship clashing OpenMP runtimes on Windows.
@@ -249,14 +248,14 @@ embedder, not the index. They aren't comparable.
 ### Main benchmark
 
 ```bash
-KMP_DUPLICATE_LIB_OK=TRUE python bench/run_ann_recall.py \
+KMP_DUPLICATE_LIB_OK=TRUE python bench/bench_recall.py \
     msmarco_embeddings_cache_v2_1000000.npy \
     --queries 1000 --k 100 --cells 7804 --rerank 32 \
     --per-dim-sq --two-stage \
     --systems v2-binary,faiss-hnsw,faiss-ivf,faiss-hnsw-sq,faiss-ivf-sq
 ```
 
-Systems: `v2-f32`, `v2-i8`, `v2-binary`, `aigvs` (old engine), `faiss-hnsw`, `faiss-ivf`, `faiss-hnsw-sq`,
+Systems: `v2-f32`, `v2-i8`, `v2-binary`, `faiss-hnsw`, `faiss-ivf`, `faiss-hnsw-sq`,
 `faiss-ivf-sq`, `faiss-ivfpq`.
 
 Main flags: `--cells`, `--rerank`, `--per-dim-sq`, `--two-stage`, `--adaptive`, `--tree`,
@@ -273,8 +272,8 @@ Two harness bugs were fixed on 2026-07-27, and numbers from before that are affe
 
 ### Build time: `add_batch` is O(N*d) per call
 
-`run_ann_recall.py` ingests in 5 chunks of 200k and reports 74.7 s at 1M;
-`bench/ab_centroid_sq8.py` builds the same index with one `add_batch` call in 12.2 s. The
+`bench_recall.py` ingests in 5 chunks of 200k and reports 74.7 s at 1M;
+`bench/research/ab_centroid_sq8.py` builds the same index with one `add_batch` call in 12.2 s. The
 tree isn't the difference: every `add_batch` ends in `refresh_derived()`, and its
 `recompute_radii` is a scalar O(N*d) pass over the whole arena, so chunked ingest costs
 `chunks * N * d`.
@@ -301,18 +300,18 @@ Results are printed and written to `bench/results/<tag>.json`.
 ### Churn
 
 ```bash
-KMP_DUPLICATE_LIB_OK=TRUE python bench/run_churn.py <corpus.npy> \
+KMP_DUPLICATE_LIB_OK=TRUE python bench/bench_churn.py <corpus.npy> \
     --cycles 10 --churn 0.10 --cells 314 --nprobe 32
 ```
 
-This one still builds with the old config (`set_i8_rerank`, no per-dim SQ8, no tree, no
-`compact()`). The churn numbers in `notes/2026-07-27.md` came from a separate script using the
-current config, so update this before quoting it.
+Uses the current configuration and tracks recall, delete cost and locality separately, because
+only the first two need no maintenance. Locality decays and `compact()` restores it; the run
+times that too.
 
 ### Tests
 
 ```bash
-KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index_v2.py
+KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index.py
 ```
 
 30 checks: round trip, delete, save/load, maintenance, adaptive vs exhaustive, two-stage vs
@@ -321,7 +320,7 @@ measures the uniform-random baseline for the same shape and fails if the fixture
 better.
 
 If a test is about a structure, assert that the structure exists
-(`assert stats()['tree_depth'] >= 1`). Two bugs hid behind tests that passed without the
+(`assert stats()['tree_depth'] >= 1`). Two bugs in July hid behind tests that passed without the
 feature being on.
 
 ## 8. Performance model
