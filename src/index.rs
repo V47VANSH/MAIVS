@@ -25,9 +25,8 @@ use pyo3::prelude::*;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use crate::rabitq;
+use crate::quantize as rabitq;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -277,7 +276,7 @@ fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     dot_i8_scalar(a, b)
 }
 
-/// Re-export of the SIMD dot for sibling modules (centroid_index).
+/// Re-export of the SIMD dot for sibling modules (graph, tree).
 #[inline(always)]
 pub(crate) fn dot_f32_pub(a: &[f32], b: &[f32]) -> f32 {
     dot_f32(a, b)
@@ -357,7 +356,7 @@ pub(crate) const ASSIGN_CANDIDATES: usize = 64;
 pub(crate) struct AssignScratch {
     rot: Vec<f32>,
     bits: Vec<u64>,
-    ts: crate::centroid_tree::TreeScratch,
+    ts: crate::tree::TreeScratch,
     out: Vec<u32>,
     scored: Vec<(u32, f32)>,
 }
@@ -367,7 +366,7 @@ impl AssignScratch {
         AssignScratch {
             rot: vec![0f32; dim_pad],
             bits: vec![0u64; n_words],
-            ts: crate::centroid_tree::TreeScratch::new(),
+            ts: crate::tree::TreeScratch::new(),
             out: Vec::new(),
             scored: Vec::new(),
         }
@@ -431,10 +430,10 @@ pub struct FlatCellIndex {
     pub(crate) centroid_sq8: bool,
     /// HNSW over the centroids, built only past MIN_CELLS_FOR_GRAPH.  Not
     /// persisted: it is a pure function of the centroids and rebuilds fast.
-    pub(crate) cent_graph: Option<crate::centroid_index::CentroidIndex>,
+    pub(crate) cent_graph: Option<crate::graph::CentroidIndex>,
     /// Dynamic-depth tree over the centroids. Depth follows from the cell count (1 level at 1M, 2
     /// at 10M, 3-4 at 1B). Derived state: rebuilt on load, not saved.
-    pub(crate) cent_tree: Option<crate::centroid_tree::CentroidTree>,
+    pub(crate) cent_tree: Option<crate::tree::CentroidTree>,
     pub(crate) tree_route: bool,
     pub(crate) tree_min_cells: usize,
     pub(crate) tree_fanout: usize,
@@ -503,7 +502,7 @@ pub(crate) struct SearchBuf {
     /// Separate visited stamps for the centroid graph; its nodes are cells, not slots.
     gvisited: Vec<u32>,
     /// Descent scratch for the centroid tree, so routing allocates nothing.
-    tscratch: crate::centroid_tree::TreeScratch,
+    tscratch: crate::tree::TreeScratch,
     tout: Vec<u32>,
     /// Query pre-scaled by the centroid SQ8 step, so the re-order's inner loop
     /// is a plain dot over u8 codes rather than a dequantize per element.
@@ -522,7 +521,7 @@ impl SearchBuf {
             visited: Vec::new(),
             epoch: 0,
             gvisited: Vec::new(),
-            tscratch: crate::centroid_tree::TreeScratch::new(),
+            tscratch: crate::tree::TreeScratch::new(),
             tout: Vec::new(),
             cqs: Vec::new(),
         }
@@ -547,7 +546,7 @@ impl FlatCellIndex {
         for &i in &live {
             flat.extend_from_slice(&self.cells[i].centroid);
         }
-        let mut g = crate::centroid_index::build_from_cells(&flat, self.dim);
+        let mut g = crate::graph::build_from_cells(&flat, self.dim);
 
         // Attach 1-bit codes in node order so traversal reads 64 B per node instead of 1536 B.
         // Built here rather than taken from cent_bits, because those are indexed by cell id and
@@ -610,7 +609,7 @@ impl FlatCellIndex {
         for &i in &live {
             flat.extend_from_slice(&self.cells[i as usize].centroid);
         }
-        self.cent_tree = crate::centroid_tree::CentroidTree::build(
+        self.cent_tree = crate::tree::CentroidTree::build(
             &flat, &live, self.dim, &self.rot_signs, self.dim_pad,
             self.n_words, self.tree_fanout, self.tree_beam_frac,
         );
@@ -1625,12 +1624,12 @@ impl FlatCellIndex {
             cent_graph: None,
             graph_ids: Vec::new(),
             graph_route: true,
-            graph_min_cells: crate::centroid_index::MIN_CELLS_FOR_GRAPH,
+            graph_min_cells: crate::graph::MIN_CELLS_FOR_GRAPH,
             cent_tree: None,
             tree_route: true,
-            tree_min_cells: crate::centroid_tree::MIN_CELLS_FOR_TREE,
-            tree_fanout: crate::centroid_tree::DEFAULT_FANOUT,
-            tree_beam_frac: crate::centroid_tree::DEFAULT_BEAM_FRAC,
+            tree_min_cells: crate::tree::MIN_CELLS_FOR_TREE,
+            tree_fanout: crate::tree::DEFAULT_FANOUT,
+            tree_beam_frac: crate::tree::DEFAULT_BEAM_FRAC,
             tree_cells: 0,
             par_scan: false,
             two_stage: false,
@@ -1684,7 +1683,7 @@ impl FlatCellIndex {
             (data.to_vec(), n_all)
         };
 
-        let mut cents = crate::centroid_tree::hierarchical_kmeans(
+        let mut cents = crate::tree::hierarchical_kmeans(
             &train, n_train, self.dim, n_cells, seed);
         for c in cents.chunks_exact_mut(self.dim) {
             let nrm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1835,11 +1834,20 @@ impl FlatCellIndex {
         self.quant_scale = scale;
     }
 
-    /// Configure redundant assignment.
+    /// Rerank depth as a multiple of k: the top k * rerank_factor by scan score are rescored
+    /// exactly.
     ///
-    /// max_assign is the total number of cells a vector can be in (1 = no replication). A vector
-    /// only spills into another cell if that cell's centroid similarity is within spill_margin of
-    /// the best, so replication goes to boundary vectors instead of everything.
+    /// Query-time only, so it can be changed on a built index and a sweep needs one build.
+    ///
+    /// It shouldn't really be a constant. With exhaustive probing every vector is scored by its
+    /// 1-bit code and only the top k*rf are reranked, so a true neighbour is lost if its Hamming
+    /// rank is above k*rf. Staying in the top 320 of 10k is easy, of 5M it isn't, which is why the
+    /// recall ceiling drops with N at a fixed rf. Better to scale it with the number of vectors
+    /// scanned.
+    fn set_rerank_factor(&mut self, rf: usize) {
+        self.rerank_factor = rf.max(1);
+    }
+
     fn set_replication(&mut self, max_assign: usize, spill_margin: f32) {
         self.max_assign = max_assign.max(1);
         self.spill_margin = spill_margin.max(0.0);
@@ -2268,7 +2276,7 @@ impl FlatCellIndex {
         // changes the exponent, not just the constant. 128 was the best of {128, 256, 512, 1024}
         // and scanned 3.3x fewer vectors than 1024 at R@10 0.99.
         let target_cells = (n / TARGET_CELL_SIZE).max(1);
-        let want_graph = target_cells >= crate::centroid_index::MIN_CELLS_FOR_GRAPH;
+        let want_graph = target_cells >= crate::graph::MIN_CELLS_FOR_GRAPH;
         (target_cells, want_graph)
     }
 

@@ -12,7 +12,6 @@
 //! Below a few thousand centroids the flat scan wins (sequential, vectorised, no pointer chasing),
 //! so this only turns on past MIN_CELLS_FOR_GRAPH.
 
-use rayon::prelude::*;
 use std::collections::BinaryHeap;
 
 /// Below this many cells a flat SIMD scan of the centroids beats graph traversal, and the graph
@@ -85,11 +84,11 @@ impl CentroidIndex {
     #[inline]
     fn sim(&self, q: &Probe, i: u32) -> f32 {
         match q {
-            Probe::F32(v) => crate::index_v2::dot_f32_pub(v, self.vec_of(i)),
+            Probe::F32(v) => crate::index::dot_f32_pub(v, self.vec_of(i)),
             Probe::Bits(b) => {
                 let s = i as usize * self.n_words;
-                let h = crate::rabitq::hamming(b, &self.codes[s..s + self.n_words]);
-                crate::rabitq::hamming_score(h, self.n_words * 64)
+                let h = crate::quantize::hamming(b, &self.codes[s..s + self.n_words]);
+                crate::quantize::hamming_score(h, self.n_words * 64)
             }
         }
     }

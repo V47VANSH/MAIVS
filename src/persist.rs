@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
-use crate::index_v2::{Cell, FlatCellIndex, ScanMode};
-use crate::rabitq;
+use crate::index::{Cell, FlatCellIndex, ScanMode};
+use crate::quantize as rabitq;
 
 const MAGIC: &[u8; 8] = b"AIGVS2\x00\x01";
 
@@ -227,7 +227,7 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
         cent_graph: None,
         graph_ids: Vec::new(),
         graph_route: true,
-        graph_min_cells: crate::centroid_index::MIN_CELLS_FOR_GRAPH,
+        graph_min_cells: crate::graph::MIN_CELLS_FOR_GRAPH,
         // derived state: rebuilt by finish_load(), not written to disk (the tree only depends on
         // the centroids)
         tags,

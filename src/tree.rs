@@ -30,7 +30,7 @@
 
 use rayon::prelude::*;
 
-use crate::rabitq;
+use crate::quantize as rabitq;
 
 /// Children per node.  64 codes x 64 B = 4 KB per expansion: one comfortable
 /// sequential burst, and small enough that a wide beam stays cheap.
@@ -160,7 +160,7 @@ fn kmeans_spherical(x: &[f32], n: usize, dim: usize, k: usize, iters: usize,
                 let mut best_s = f32::NEG_INFINITY;
                 for j in 0..k {
                     let c = &cents[j * dim..(j + 1) * dim];
-                    let s = crate::index_v2::dot_f32_pub(v, c);
+                    let s = crate::index::dot_f32_pub(v, c);
                     if s > best_s {
                         best_s = s;
                         best = j as u32;

@@ -20,7 +20,7 @@
 //! cells would mean rewriting every slot's back-pointer; an empty cell only costs one centroid dot
 //! during routing and the scan skips it.
 
-use crate::index_v2::{Cell, FlatCellIndex};
+use crate::index::{Cell, FlatCellIndex};
 
 /// Fetch a member's vector as f32, from whichever representation exists.
 fn vec_of(ix: &FlatCellIndex, slot: u32) -> Vec<f32> {
@@ -30,7 +30,7 @@ fn vec_of(ix: &FlatCellIndex, slot: u32) -> Vec<f32> {
     } else if ix.f16_rerank {
         ix.rr_f16[off..off + ix.dim]
             .iter()
-            .map(|&h| crate::index_v2::f16_to_f32(h))
+            .map(|&h| crate::index::f16_to_f32(h))
             .collect()
     } else if ix.per_dim_sq {
         (0..ix.dim)
@@ -219,7 +219,7 @@ pub(crate) fn maintain(
             for &i in &live {
                 flat.extend_from_slice(&ix.cells[i].centroid);
             }
-            merge_graph = Some(crate::centroid_index::build_from_cells(&flat, dim));
+            merge_graph = Some(crate::graph::build_from_cells(&flat, dim));
             merge_ids = live.iter().map(|&i| i as u32).collect();
         }
     }

@@ -45,7 +45,7 @@ use parking_lot::RwLock;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::index_v2::{FlatCellIndex, SearchBuf};
+use crate::index::{FlatCellIndex, SearchBuf};
 
 /// Over-fetch factor on k per segment, so dropping tombstoned hits afterwards doesn't eat into the
 /// requested k.
