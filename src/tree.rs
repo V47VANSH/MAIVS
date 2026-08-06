@@ -221,12 +221,24 @@ pub(crate) fn hierarchical_kmeans(x: &[f32], n: usize, dim: usize, k: usize,
         groups[a as usize].push(i as u32);
     }
 
-    // Sub-clusters proportional to group size, so the final cells stay
-    // balanced even when the top level is not.
-    let mut out = vec![0f32; k * dim];
+    // Sub-clusters proportional to group size, so cells stay balanced even if the top level isn't.
+    // Two phases, because the budget arithmetic is sequential but the clustering isn't.
+    //
+    // The single loop this replaces carried a running `written` counter, which forced the
+    // sub-clusterings to run one after another. kmeans_spherical only parallelises over its own
+    // points, and at the second level a group has ~n/sqrt(k) points (3,300 at k=90,000), not enough
+    // to keep 16 cores busy. Training went from 7.8 s at 62,500 cells to over 550 s at 90,000,
+    // about 25x worse than the FLOP count, which made small cells unusable at scale even though
+    // they scan 2.35-2.95x fewer vectors (RESULTS_v2.md 1.3).
+    //
+    // Phase 1 computes each group's share and output offset; phase 2 runs the clusterings in
+    // parallel into disjoint slices. Same output, since the share arithmetic is unchanged and each
+    // group still gets its own deterministic seed.
+    let mut subs = vec![0usize; groups.len()];
+    let mut offs = vec![0usize; groups.len()];
     let mut written = 0usize;
     for (g, idx) in groups.iter().enumerate() {
-        if idx.is_empty() {
+        if idx.is_empty() || written >= k {
             continue;
         }
         let remaining_groups = k1 - g;
@@ -238,20 +250,40 @@ pub(crate) fn hierarchical_kmeans(x: &[f32], n: usize, dim: usize, k: usize,
         if sub == 0 {
             continue;
         }
-        let mut buf = vec![0f32; idx.len() * dim];
-        for (r, &i) in idx.iter().enumerate() {
-            buf[r * dim..(r + 1) * dim]
-                .copy_from_slice(&x[i as usize * dim..(i as usize + 1) * dim]);
+        subs[g] = sub.min(k - written);
+        offs[g] = written;
+        written += subs[g];
+    }
+
+    let mut out = vec![0f32; k * dim];
+    {
+        // Hand each group a disjoint output slice so the clusterings can run
+        // concurrently without sharing anything.
+        let mut rest: &mut [f32] = &mut out;
+        let mut cursor = 0usize;
+        let mut chunks: Vec<(usize, &mut [f32])> = Vec::new();
+        let mut order: Vec<usize> = (0..groups.len()).filter(|&g| subs[g] > 0).collect();
+        order.sort_by_key(|&g| offs[g]);
+        for &g in &order {
+            let skip = offs[g] * dim - cursor;
+            let (_, tail) = rest.split_at_mut(skip);
+            let (mine, tail) = tail.split_at_mut(subs[g] * dim);
+            chunks.push((g, mine));
+            cursor = (offs[g] + subs[g]) * dim;
+            rest = tail;
         }
-        let (_, cs) = kmeans_spherical(&buf, idx.len(), dim, sub, 12,
-                                       seed ^ (g as u64 + 1).wrapping_mul(0x9E3779B9));
-        let take = sub.min(k - written);
-        out[written * dim..(written + take) * dim]
-            .copy_from_slice(&cs[..take * dim]);
-        written += take;
-        if written >= k {
-            break;
-        }
+        chunks.par_iter_mut().for_each(|(g, dst)| {
+            let idx = &groups[*g];
+            let mut buf = vec![0f32; idx.len() * dim];
+            for (r, &i) in idx.iter().enumerate() {
+                buf[r * dim..(r + 1) * dim]
+                    .copy_from_slice(&x[i as usize * dim..(i as usize + 1) * dim]);
+            }
+            let (_, cs) = kmeans_spherical(
+                &buf, idx.len(), dim, subs[*g], 12,
+                seed ^ (*g as u64 + 1).wrapping_mul(0x9E3779B9));
+            dst.copy_from_slice(&cs[..subs[*g] * dim]);
+        });
     }
     // Any shortfall (empty groups) is filled from the data so no centroid row
     // is left as zeros, which would be a cell nothing can ever route to.
