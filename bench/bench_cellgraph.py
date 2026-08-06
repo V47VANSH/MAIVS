@@ -127,6 +127,11 @@ def main():
     ap.add_argument("--deg", type=int, default=32)
     ap.add_argument("--efs", default="8,16,32,64,128,256,512")
     ap.add_argument("--entries", type=int, default=4)
+    ap.add_argument("--seed-mode", default="rank",
+                    choices=["rank", "fixed"],
+                    help="rank = top-entries cells by centroid (a global "
+                         "ranking, so the walk is redundant with flat); "
+                         "fixed = one fixed entry cell, navigate in")
     ap.add_argument("--queries", type=int, default=200)
     ap.add_argument("--gt-queries", type=int, default=1000)
     ap.add_argument("--k", type=int, default=100)
@@ -174,6 +179,9 @@ def main():
         Qd = torch.from_numpy(Q).to(_dev())
         cent_rank = (Qd @ Cd.T).topk(min(4096, M), dim=1).indices.cpu().numpy()
         sizes_arr = part.sizes.astype(np.float64)
+        # medoid cell: the single best-connected entry point, the
+        # role HNSW's top layer plays.
+        fixed_entry = np.array([int(np.argmax(C @ C.mean(0)))])
 
         rows = []
         for mode in modes:
@@ -194,9 +202,10 @@ def main():
                 else:
                     hit, sc = 0, 0
                     for i in range(len(Q)):
+                        ent = (cent_rank[i, :a.entries] if a.seed_mode == "rank"
+                               else fixed_entry)
                         ids, cells = walk(Q[i], C, part, X, adjs[mode],
-                                          cent_rank[i, :a.entries], ef,
-                                          budget=ef)
+                                          ent, ef, budget=ef)
                         hit += len(gt10[i] & set(ids))
                         sc += cells
                     r10 = hit / (len(Q) * 10)

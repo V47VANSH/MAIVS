@@ -43,8 +43,18 @@ PROFILES: Dict[str, dict] = {
     # 464 B/vec.  The configuration to quote for memory and throughput.
     "memory": dict(scan="binary", rerank=32, per_dim_sq=True, adaptive=True,
                    parallel=False),
-    # 1,616 B/vec.  Highest recall: R@10 0.9998, MRR 1.0000 at 1M.
-    "quality": dict(scan="binary", rerank=32, per_dim_sq=False, adaptive=True,
+    # 1,616 B/vec. Highest recall: R@10 0.9999 at 1M.
+    #
+    # rerank=128 instead of 32. With exhaustive probing every vector is scored by its 1-bit code and
+    # only the top k*rf are rescored exactly, so a neighbour is lost once its Hamming rank exceeds
+    # k*rf. That's easy to avoid in the top 320 of 10k, not of 5M, so a fixed rf loses recall as N
+    # grows: -0.0082 per decade at rf=32 vs -0.0044 at rf=128. At 1M, rf=128 gives +0.0144 R@10 for
+    # 4% throughput at exhaustive probing (RESULTS_v2.md 1.3).
+    #
+    # The memory profile keeps rf=32 because it runs at low nprobe, where the rerank is a big part
+    # of the cost: at nprobe=64 the scan is 524 KB and rf=128 would add 492 KB. Better long term to
+    # scale rf with the number of vectors scanned; set_rerank_factor makes that a query-time choice.
+    "quality": dict(scan="binary", rerank=128, per_dim_sq=False, adaptive=True,
                     parallel=False),
     # Latency-optimised: intra-query parallel scan, adaptive off (it is
     # sequential by nature and costs serial latency).
