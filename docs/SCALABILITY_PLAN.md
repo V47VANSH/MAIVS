@@ -99,6 +99,10 @@ would be to parallelise over groups (`par_iter` over the group loop) instead of 
 This is the most useful next task: it would make c=16 usable (another ~1.4x over c=32), and it's a small
 change in `src/tree.rs`.
 
+Update: the group loop now runs in parallel (`src/tree.rs`). It builds,
+but I haven't been able to verify it yet because the machine was out of memory; see
+`RESULTS.md` part VI.
+
 ## Why "navigate without a graph" can't work
 
 The next idea was to get away from global ranking the way HNSW does, by navigating. The reasoning:
@@ -285,6 +289,41 @@ small cells while the number of competing cells grows with N. Matching a graph i
 means leaving the family, not writing another router. The constant-factor wins I already have
 (`centroid_sq8` 1.22x, `rerank_factor` 32 -> 128 for +0.014 recall, cell size 128 -> 32 for ~2x)
 are real and independent of all this. They move the crossover point but don't remove it.
+
+## Tried and refuted: HNSW over cells, and a precomputed query-side index
+
+**Cell graph with a fixed entry.** `bench_cellgraph.py --seed-mode fixed` removes the flaw above
+(seeding from a global centroid ranking) and navigates in from a single medoid cell, which is what
+a graph index actually does. Worse again: alpha +0.574 at R@10 0.95 against +0.426 for flat, and
+45,452 vectors at 2M against 28,752. Greedy search over coarse cell centroids gets lost; the cell
+graph is too rough an approximation of the metric to navigate.
+
+**Precomputed query-side index.** The inversion: partition once, store for each cell the union of
+its members' top-k lists, and at query time do one lookup and scan that list. No ranking and no
+traversal, so query cost doesn't depend on N by construction.
+
+| coverage | 100k | 500k | 2M | candidates at 2M |
+|---|---|---|---|---|
+| k=10, probe=1 | 0.674 | 0.611 | 0.607 | 717 |
+| k=50, probe=1 | 0.825 | 0.759 | 0.725 | 2,593 |
+| k=50, probe=4 | 0.945 | 0.910 | 0.891 | 8,799 |
+
+Coverage falls with N, which is the one thing it wasn't supposed to do, so alpha isn't 0 after
+all; and 8,799 candidates for 0.891 is worse than flat routing's 28,752 for 0.95. Dead on its own
+numbers.
+
+### The bigger objection
+
+This design assumes a new query lands near existing data points. Every query in this document is
+a held-out corpus vector. Real queries are questions, not passages. Any design that relies on
+queries looking like the data is exactly the one that fails on real queries, and nothing here can
+detect it, because the corpus supplies both sides.
+
+That doesn't invalidate the comparisons (this index vs faiss, cell size, rerank factor, the alpha
+fits), since both sides always got the same queries. It does rule out trusting any idea that
+depends on the query distribution looking like the data. `SUMMARISER_STUDY.md` 6c already lists
+this as untested; it should block any future proposal of this kind, and it's a reason to get real
+question embeddings before going further.
 
 ## Where this leaves O(log N)
 
