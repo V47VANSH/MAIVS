@@ -99,13 +99,62 @@ pub(crate) struct CentroidTree {
 /// Per-query scratch so the descent allocates nothing.
 pub(crate) struct TreeScratch {
     frontier: Vec<u32>,
-    scored: Vec<(f32, u32)>,
+    /// (Hamming distance, node); integer distances, so selection is a counting pass
+    scored: Vec<(u32, u32)>,
     expand: Vec<u32>,
+    hist: Vec<u32>,
 }
 
 impl TreeScratch {
     pub(crate) fn new() -> Self {
-        TreeScratch { frontier: Vec::new(), scored: Vec::new(), expand: Vec::new() }
+        TreeScratch { frontier: Vec::new(), scored: Vec::new(), expand: Vec::new(),
+                      hist: Vec::new() }
+    }
+}
+
+/// Keep the `keep` entries with the smallest Hamming distance, in O(n).
+///
+/// Distances are integers in [0, bits], so one histogram pass finds the cut-off and a second pass
+/// compacts the survivors, with no sort and no float compares. Ties at the cut-off are kept in
+/// encounter order (select_nth kept an arbitrary subset; either is valid).
+fn keep_smallest(v: &mut Vec<(u32, u32)>, keep: usize, hist: &mut Vec<u32>, bits: usize) {
+    if keep >= v.len() {
+        return;
+    }
+    if hist.len() < bits + 1 {
+        hist.resize(bits + 1, 0);
+    }
+    for &(h, _) in v.iter() {
+        hist[h as usize] += 1;
+    }
+    let mut cum = 0usize;
+    let mut t = 0usize;
+    while t < bits {
+        cum += hist[t] as usize;
+        if cum >= keep {
+            break;
+        }
+        t += 1;
+    }
+    if t == bits {
+        cum += hist[t] as usize;
+    }
+    let mut need_eq = keep - (cum - hist[t] as usize);
+    let mut w = 0;
+    for r in 0..v.len() {
+        let e = v[r];
+        let h = e.0 as usize;
+        if h < t || (h == t && need_eq > 0) {
+            if h == t {
+                need_eq -= 1;
+            }
+            v[w] = e;
+            w += 1;
+        }
+    }
+    v.truncate(w);
+    for x in hist[..=bits].iter_mut() {
+        *x = 0;
     }
 }
 
@@ -541,17 +590,13 @@ impl CentroidTree {
             s.scored.clear();
             for &node in s.frontier.iter() {
                 let h = rabitq::hamming(q_bits, code_of(&level.codes, node as usize, nw));
-                s.scored.push((rabitq::hamming_score(h, bits), node));
+                s.scored.push((h, node));
             }
             let keep = beams[li].min(s.scored.len());
             if keep == 0 {
                 return;
             }
-            if keep < s.scored.len() {
-                s.scored.select_nth_unstable_by(
-                    keep - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                s.scored.truncate(keep);
-            }
+            keep_smallest(&mut s.scored, keep, &mut s.hist, bits);
 
             // Expand the kept nodes' children into the next frontier.
             s.expand.clear();
@@ -572,17 +617,13 @@ impl CentroidTree {
         s.scored.clear();
         for &leaf in s.frontier.iter() {
             let h = rabitq::hamming(q_bits, code_of(&self.leaf_codes, leaf as usize, nw));
-            s.scored.push((rabitq::hamming_score(h, bits), leaf));
+            s.scored.push((h, leaf));
         }
         let keep = want.min(s.scored.len());
         if keep == 0 {
             return;
         }
-        if keep < s.scored.len() {
-            s.scored.select_nth_unstable_by(
-                keep - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            s.scored.truncate(keep);
-        }
+        keep_smallest(&mut s.scored, keep, &mut s.hist, bits);
         out.extend(s.scored.iter().map(|&(_, leaf)| self.leaf_ids[leaf as usize]));
     }
 
