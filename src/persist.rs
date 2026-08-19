@@ -115,7 +115,8 @@ pub(crate) fn save_index(ix: &FlatCellIndex, path: &str) -> PyResult<()> {
         wr_f32(&mut w, ix.at_margin)?;
         wr_f32(&mut w, ix.tree_beam_frac)?;
 
-        wr_pod(&mut w, &ix.bits)?;
+        // Flat codes even when only FastScan blocks are resident.
+        wr_pod(&mut w, &ix.flat_bits())?;
         wr_pod(&mut w, &ix.scan_i8)?;
         wr_pod(&mut w, &ix.rr_f16)?;
         wr_pod(&mut w, &ix.sq_min)?;
@@ -253,6 +254,18 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
         n_live: h[6] as usize,
         max_assign: h[7] as usize,
         spill_margin,
+        // Not saved (keeps the file format the same). It only affects where future inserts get
+        // their extra homes; the homes already in the file are restored exactly through slot_cells.
+        spill_lambda: 0.0,
+        // Saved member order is not guaranteed to be a compacted run.
+        compacted: false,
+        asym_cascade: 0,
+        fastscan: false,
+        fs_codes: Vec::new(),
+        fs_off: Vec::new(),
+        prim_len: Vec::new(),
+        rep_off: Vec::new(),
+        rep_bits: Vec::new(),
         slot_cells,
         i8_rerank: h[9] != 0,
         f16_rerank: has_f16,

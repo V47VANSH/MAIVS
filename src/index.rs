@@ -57,6 +57,48 @@ unsafe fn hsum_ps(v: __m256) -> f32 {
     _mm_cvtss_f32(s)
 }
 
+/// Prefetch `len` bytes from `p` into L1, one hint per cache line.
+///
+/// The rescore, the rerank and cell starts read rows whose ids are known ahead of time but land at
+/// random places; issuing the loads a few iterations early overlaps the misses. Only a hint.
+#[inline(always)]
+fn prefetch_bytes(p: *const u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let mut off = 0;
+        while off < len {
+            _mm_prefetch(p.add(off) as *const i8, _MM_HINT_T0);
+            off += 64;
+        }
+    }
+}
+
+/// The want-th smallest Hamming distance among entries selected by `keep`, found with a counting
+/// pass (distances are integers in [0, bits]). Taking every entry <= the result keeps all ties at
+/// the cut-off.
+fn hamming_cutoff(hs: &[u16], keep: impl Fn(usize) -> bool, want: usize, bits: usize) -> usize {
+    if want == 0 {
+        return 0;
+    }
+    let mut hist = vec![0u32; bits + 1];
+    for (i, &h) in hs.iter().enumerate() {
+        if keep(i) {
+            hist[h as usize] += 1;
+        }
+    }
+    let mut cum = 0usize;
+    for (t, &c) in hist.iter().enumerate() {
+        cum += c as usize;
+        if cum >= want {
+            return t;
+        }
+    }
+    bits
+}
+
+/// How many items ahead to prefetch in id-driven loops.
+const PF_AHEAD: usize = 8;
+
 /// int8 dot product, 16 lanes per iteration with widening multiply-add.
 ///
 /// _mm256_madd_epi16 on sign-extended i8 avoids the unsigned-operand restriction of
@@ -464,6 +506,40 @@ pub struct FlatCellIndex {
     // is in (u32::MAX = unused), so delete can unlink all of them.
     pub(crate) max_assign: usize,
     pub(crate) spill_margin: f32,
+    /// Orthogonal polysemy strength. 0 = old margin spill (extra homes are the next-nearest cells).
+    /// > 0 = each extra home minimises ||r'||^2 + lambda * sum_h (r' . r_h_hat)^2 over the
+    /// candidates, where r_h are the residuals of the homes already chosen.
+    ///
+    /// A vector is missed when the query's projection onto its residual x - mu is large.
+    /// Next-nearest homes have residuals almost parallel to the first (log-rank correlation 0.40),
+    /// so they tend to miss together. With an orthogonal residual the misses are independent (joint
+    /// miss 0.018 vs 0.019 for the product), so the probability of missing both is the product of
+    /// the two.
+    pub(crate) spill_lambda: f32,
+    /// True when every cell's member list is one ascending run of consecutive slots, i.e. the state
+    /// compact() leaves. Set by compact_arena, cleared by any membership change (insert, delete,
+    /// split/merge, load). Lets the scan read a cell's codes directly.
+    pub(crate) compacted: bool,
+    /// Asymmetric cascade factor (0 = off). With c > 0 the Hamming stage keeps c * k *
+    /// rerank_factor survivors, an asymmetric 4-bit-query x 1-bit-code estimate
+    /// (quantize::AsymQuery) cuts them to k * rerank_factor, and only those go to the exact rerank.
+    pub(crate) asym_cascade: usize,
+    /// FastScan layout (see quantize::fs_*): each cell's members, in member order, as 32-vector
+    /// interleaved blocks at fs_codes[fs_off[c]*bb .. fs_off[c+1]*bb]. When on, the scan ranks by
+    /// the asymmetric estimate instead of Hamming. Derived state built by compact_arena, only valid
+    /// while `compacted`.
+    pub(crate) fastscan: bool,
+    pub(crate) fs_codes: Vec<u8>,
+    pub(crate) fs_off: Vec<u32>,
+    /// Polysemic runs (multi-home vectors on a compacted binary arena): cell c's members are
+    /// [primaries.., replicas..], with prim_len[c] primaries forming one contiguous slot run and
+    /// the replicas' 1-bit codes copied contiguously at rep_bits[rep_off[c]*nw .. rep_off[c+1]*nw].
+    /// So every probed cell is two sequential reads. Only the 64-byte scan code is duplicated;
+    /// rerank data stays single. Derived state built by compact_arena, only valid while
+    /// `compacted`.
+    pub(crate) prim_len: Vec<u32>,
+    pub(crate) rep_off: Vec<u32>,
+    pub(crate) rep_bits: Vec<u64>,
     pub(crate) slot_cells: Vec<u32>,
     /// Per-slot attribute for predicate pushdown.  One u32 beside the arena;
     /// empty when unused, so the unfiltered path pays nothing.
@@ -507,6 +583,12 @@ pub(crate) struct SearchBuf {
     /// Query pre-scaled by the centroid SQ8 step, so the re-order's inner loop
     /// is a plain dot over u8 codes rather than a dequantize per element.
     cqs: Vec<f32>,
+    /// Integer bucket queue for the binary scan: `hist[h]` counts kept
+    /// candidates at Hamming distance h, `hcands` holds (h, slot, asym score).
+    hist: Vec<u32>,
+    hcands: Vec<(u32, u32, f32)>,
+    /// Probe rank of each stamped cell (valid where `visited[c] == epoch`).
+    crank: Vec<u32>,
 }
 
 impl SearchBuf {
@@ -524,6 +606,9 @@ impl SearchBuf {
             tscratch: crate::tree::TreeScratch::new(),
             tout: Vec::new(),
             cqs: Vec::new(),
+            hist: Vec::new(),
+            hcands: Vec::new(),
+            crank: Vec::new(),
         }
     }
 }
@@ -690,11 +775,11 @@ impl FlatCellIndex {
     fn dot_cent_sq8(&self, ci: usize, cqs: &[f32], base: f32) -> f32 {
         let off = ci * self.dim;
         let code = &self.cent_sq8[off..off + self.dim];
-        let mut acc = 0.0f32;
-        for j in 0..self.dim {
-            acc += code[j] as f32 * cqs[j];
-        }
-        acc + base
+        // Same u8 x f32 AVX2 dot as the SQ8 rerank (bytes reinterpreted as unsigned). The scalar
+        // loop here was ~60% of routing time: nprobe*2 shortlisted cells x dim multiply-adds.
+        let code_i8: &[i8] =
+            unsafe { std::slice::from_raw_parts(code.as_ptr() as *const i8, code.len()) };
+        dot_f32_u8(cqs, code_i8) + base
     }
 
     /// Score a cell for the stage-2 re-order, at whatever precision is on.
@@ -715,87 +800,127 @@ impl FlatCellIndex {
 
     /// Recompute every cell's angular radius from its current members.
     ///
-    /// Uses the f32 arena if present, otherwise dequantizes the int8 copy. Run after a batch
+    /// Uses the f32 arena if present, otherwise dequantizes the int8/SQ8 copy. Run after a batch
     /// insert, once centroids are updated.
+    ///
+    /// Parallel over cells, with each member dot going through the SIMD kernels (the per-dimension
+    /// SQ8 dequantize is folded into a per-cell weight vector: sum (c*step + min) * mu = c .
+    /// (step*mu) + min . mu). It used to be a serial scalar O(N*d) pass, 0.5 s at 1M on the build's
+    /// critical path.
     fn recompute_radii(&mut self) {
         let inv = if self.quant_scale > 0.0 { 1.0 / self.quant_scale } else { 1.0 };
         let dim = self.dim;
-        let keep_f32 = self.keep_f32;
-        for ci in 0..self.cells.len() {
-            let mut angs: Vec<f32> = Vec::with_capacity(self.cells[ci].members.len());
-            for mi in 0..self.cells[ci].members.len() {
-                let slot = self.cells[ci].members[mi] as usize;
-                let off = slot * dim;
-                let dot = if self.f16_rerank {
-                    let mut d = 0.0f32;
-                    for j in 0..dim {
-                        d += f16_to_f32(self.rr_f16[off + j]) * self.cells[ci].centroid[j];
-                    }
-                    d
-                } else if self.per_dim_sq {
-                    let mut d = 0.0f32;
-                    for j in 0..dim {
-                        let c = (self.scan_i8[off + j] as u8) as f32;
-                        d += (c * self.sq_step[j] + self.sq_min[j])
-                            * self.cells[ci].centroid[j];
-                    }
-                    d
-                } else if keep_f32 {
-                    let mut d = 0.0f32;
-                    for j in 0..dim {
-                        d += self.vecs_f32[off + j] * self.cells[ci].centroid[j];
-                    }
-                    d
+        let me = &*self;
+        let radii: Vec<(f32, f32)> = (0..me.cells.len())
+            .into_par_iter()
+            .map(|ci| {
+                let cell = &me.cells[ci];
+                if cell.members.is_empty() {
+                    return (0.0, 0.0);
+                }
+                let mu = &cell.centroid;
+                let (w, base): (Vec<f32>, f32) = if !me.f16_rerank && me.per_dim_sq {
+                    let w = (0..dim).map(|j| me.sq_step[j] * mu[j]).collect();
+                    (w, (0..dim).map(|j| me.sq_min[j] * mu[j]).sum())
                 } else {
-                    let mut d = 0.0f32;
-                    for j in 0..dim {
-                        d += self.scan_i8[off + j] as f32 * inv * self.cells[ci].centroid[j];
-                    }
-                    d
+                    (Vec::new(), 0.0)
                 };
-                angs.push(dot.clamp(-1.0, 1.0).acos());
-            }
-            if angs.is_empty() {
-                self.cells[ci].r_bound = 0.0;
-                self.cells[ci].r_max = 0.0;
-                continue;
-            }
-            angs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            let p99 = ((angs.len() as f32 * 0.99).ceil() as usize)
-                .saturating_sub(1)
-                .min(angs.len() - 1);
-            self.cells[ci].r_bound = angs[p99];
-            self.cells[ci].r_max = angs[angs.len() - 1];
+                let mut angs: Vec<f32> = Vec::with_capacity(cell.members.len());
+                for &slot in cell.members.iter() {
+                    let off = slot as usize * dim;
+                    let dot = if me.f16_rerank {
+                        dot_f32_f16(mu, &me.rr_f16[off..off + dim])
+                    } else if me.per_dim_sq {
+                        dot_f32_u8(&w, &me.scan_i8[off..off + dim]) + base
+                    } else if me.keep_f32 {
+                        dot_f32(mu, &me.vecs_f32[off..off + dim])
+                    } else {
+                        dot_f32_i8(mu, &me.scan_i8[off..off + dim]) * inv
+                    };
+                    angs.push(dot.clamp(-1.0, 1.0).acos());
+                }
+                let p99 = ((angs.len() as f32 * 0.99).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(angs.len() - 1);
+                let r_max = angs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let (_, r_b, _) = angs.select_nth_unstable_by(p99, |a, b| a.partial_cmp(b).unwrap());
+                (*r_b, r_max)
+            })
+            .collect();
+        for (c, (rb, rm)) in self.cells.iter_mut().zip(radii) {
+            c.r_bound = rb;
+            c.r_max = rm;
         }
     }
 
     /// Recompute radii and centroid codes after cells change.
     pub(crate) fn refresh_derived(&mut self) {
+        let mut lap = crate::prof::Lap::start();
         self.recompute_radii();
+        lap.mark(crate::prof::B_RADII);
         if self.two_stage {
             self.rebuild_centroid_codes();
         }
         if self.centroid_sq8 {
             self.rebuild_centroid_sq8();
         }
+        lap.mark(crate::prof::B_CODES);
         self.rebuild_centroid_graph();
         self.maybe_rebuild_centroid_tree();
+        lap.mark(crate::prof::B_TREE);
     }
 
-    /// Reorder the arena so every cell's members are contiguous, in cell order.
+    /// Make sure the flat per-slot codes exist.
     ///
-    /// Slots are handed out in insertion order, so a cell's members are spread across the arena and
-    /// scanning a cell is a random gather: one cache line per vector at 64 B/vec, nothing for the
-    /// prefetcher to follow. At 1M a query moved ~10 MB but took 4.1 ms, ~2 GB/s, against the ~25
-    /// GB/s a streaming scan should get.
-    ///
-    /// After compaction each cell is one sequential run, and the byte-based cost model actually
-    /// matches. With 128 vectors per cell it's the difference between one 8 KB read and 128
-    /// scattered cache lines.
-    ///
-    /// Deletes (swap_remove + free list) and later inserts scatter the layout again, so this is
-    /// safe and cheap to re-run as maintenance.
+    /// With FastScan, compact() frees the flat code arena because the blocks hold the same bits.
+    /// Anything that needs flat codes (a mutation, re-compaction, save) calls this first; it
+    /// decodes every live slot's code from its primary cell's block, in parallel.
+    pub(crate) fn ensure_bits(&mut self) {
+        if let std::borrow::Cow::Owned(b) = self.flat_bits() {
+            self.bits = b;
+        }
+    }
+
+    /// The flat per-slot code arena: borrowed when present, otherwise decoded
+    /// from the FastScan blocks (each live slot from its primary cell).
+    pub(crate) fn flat_bits(&self) -> std::borrow::Cow<'_, [u64]> {
+        let nw = self.n_words;
+        if self.scan_mode != ScanMode::Binary || nw == 0 || self.fs_off.is_empty()
+            || self.bits.len() >= self.ext_ids.len() * nw {
+            return std::borrow::Cow::Borrowed(&self.bits[..]);
+        }
+        let bb = rabitq::fs_block_bytes(nw);
+        let decoded: Vec<Vec<(u32, Vec<u64>)>> = (0..self.cells.len())
+            .into_par_iter()
+            .map(|ci| {
+                let mem = &self.cells[ci].members;
+                let b0 = self.fs_off[ci] as usize;
+                let mut out = Vec::new();
+                for (pos, &slot) in mem.iter().enumerate() {
+                    if self.slot_cell[slot as usize] as usize != ci {
+                        continue; // replica entry: its primary decodes it
+                    }
+                    let b = b0 + pos / rabitq::FS_BLOCK;
+                    let mut code = vec![0u64; nw];
+                    rabitq::fs_unpack(&self.fs_codes[b * bb..(b + 1) * bb],
+                                      pos % rabitq::FS_BLOCK, nw, &mut code);
+                    out.push((slot, code));
+                }
+                out
+            })
+            .collect();
+        let mut bits = vec![0u64; self.ext_ids.len() * nw];
+        for cell in decoded {
+            for (slot, code) in cell {
+                let o = slot as usize * nw;
+                bits[o..o + nw].copy_from_slice(&code);
+            }
+        }
+        std::borrow::Cow::Owned(bits)
+    }
+
     pub(crate) fn compact_arena(&mut self) {
+        self.ensure_bits();
         let old_n = self.ext_ids.len();
         if old_n == 0 {
             return;
@@ -902,6 +1027,81 @@ impl FlatCellIndex {
         }
         // The arena is dense again, so nothing is free.
         self.free_slots.clear();
+
+        // Polysemic runs: primaries first (one contiguous ascending run, from the placement order
+        // above), then replicas, whose codes are copied into a contiguous block per cell.
+        self.prim_len.clear();
+        self.rep_off.clear();
+        self.rep_bits.clear();
+        if self.max_assign > 1 && self.scan_mode == ScanMode::Binary && nw > 0 {
+            let copy_replicas = !self.fastscan;   // FastScan blocks hold them
+            self.rep_off.push(0);
+            for ci in 0..self.cells.len() {
+                let mem = std::mem::take(&mut self.cells[ci].members);
+                let mut prim: Vec<u32> = Vec::with_capacity(mem.len());
+                let mut repl: Vec<u32> = Vec::new();
+                for &m in mem.iter() {
+                    if self.slot_cell[m as usize] as usize == ci {
+                        prim.push(m);
+                    } else {
+                        repl.push(m);
+                    }
+                }
+                prim.sort_unstable();
+                repl.sort_unstable();
+                self.prim_len.push(prim.len() as u32);
+                if copy_replicas {
+                    for &r in repl.iter() {
+                        let o = r as usize * nw;
+                        self.rep_bits.extend_from_slice(&self.bits[o..o + nw]);
+                    }
+                }
+                let last = *self.rep_off.last().unwrap();
+                self.rep_off.push(last + repl.len() as u32);
+                prim.extend_from_slice(&repl);
+                self.cells[ci].members = prim;
+            }
+        }
+        // FastScan blocks over each cell's member order (primaries, then
+        // replicas), built in parallel over cells.
+        self.fs_codes = Vec::new();
+        self.fs_off = Vec::new();
+        if self.fastscan && self.scan_mode == ScanMode::Binary && nw > 0 {
+            let bb = rabitq::fs_block_bytes(nw);
+            let me = &*self;
+            let per_cell: Vec<Vec<u8>> = (0..me.cells.len())
+                .into_par_iter()
+                .map(|ci| {
+                    let mem = &me.cells[ci].members;
+                    let nb = (mem.len() + rabitq::FS_BLOCK - 1) / rabitq::FS_BLOCK;
+                    let mut out = vec![0u8; nb * bb];
+                    for b in 0..nb {
+                        let lo = b * rabitq::FS_BLOCK;
+                        let hi = (lo + rabitq::FS_BLOCK).min(mem.len());
+                        let lanes: Vec<&[u64]> = mem[lo..hi]
+                            .iter()
+                            .map(|&sl| &me.bits[sl as usize * nw..(sl as usize + 1) * nw])
+                            .collect();
+                        rabitq::fs_pack_block(&lanes, nw, &mut out[b * bb..(b + 1) * bb]);
+                    }
+                    out
+                })
+                .collect();
+            let mut off = Vec::with_capacity(per_cell.len() + 1);
+            off.push(0u32);
+            let total: usize = per_cell.iter().map(|v| v.len()).sum();
+            let mut codes = Vec::with_capacity(total);
+            for v in per_cell {
+                codes.extend_from_slice(&v);
+                off.push((codes.len() / bb) as u32);
+            }
+            self.fs_codes = codes;
+            self.fs_off = off;
+            // The blocks now hold every code: free the flat copies.
+            self.bits = Vec::new();
+            self.rep_bits = Vec::new();
+        }
+        self.compacted = true;
     }
 
     /// Rebuild derived state after a load.  `cent_bits` is not stored on
@@ -952,20 +1152,17 @@ impl FlatCellIndex {
         }
     }
 
-    /// Core single-query path.  Returns top-k as (score, slot), best first.
-    fn search_one(
-        &self,
-        q: &[f32],
-        k: usize,
-        nprobe: usize,
-        target_confidence: f32,
-        beta: f32,
-        buf: &mut SearchBuf,
-    ) -> Vec<(f32, u32)> {
-        // Disjoint field borrows so the quantized query and the candidate
-        // buffer can be held at once.
-        let SearchBuf { cscores, chosen, cands, q_i8, rot, q_bits, visited, epoch,
-                        gvisited, tscratch, tout, cqs } = buf;
+    /// Steps 1-2 of a query: route to cells, then nucleus selection.
+    ///
+    /// Leaves the probe list in buf.chosen (best first), the matching scores as the prefix of
+    /// buf.cscores, and the query's binary code in buf.q_bits if the router computed it (the return
+    /// value). Used by both the per-query path and the cell-major batch path, so they route the
+    /// same.
+    fn route_query(&self, q: &[f32], nprobe: usize, target_confidence: f32, beta: f32,
+                   buf: &mut SearchBuf) -> bool {
+        let SearchBuf { cscores, chosen, rot, q_bits, epoch, gvisited, tscratch, tout,
+                        cqs, .. } = buf;
+        let mut lap = crate::prof::Lap::start();
         // Pre-scale the query for the SQ8 centroid re-order, once per query.
         let mut cqbase = 0.0f32;
         let cent_q8 = self.centroid_sq8 && !self.cent_sq8.is_empty();
@@ -978,59 +1175,33 @@ impl FlatCellIndex {
                 cqbase += q[j] * self.csq_min[j];
             }
         }
-        let dedup = self.max_assign > 1;
-        if dedup {
-            if visited.len() < self.ext_ids.len() {
-                visited.resize(self.ext_ids.len(), 0);
-            }
-            *epoch += 1;
-            if *epoch == u32::MAX {
-                // Wrapped: reset stamps so stale marks cannot alias.
-                for v in visited.iter_mut() { *v = 0; }
-                *epoch = 1;
-            }
-        }
-        let ep = *epoch;
-        // Filter check inside the scan: one u32 compare per member, before the distance is
-        // computed, so a selective filter makes the query cheaper. (In a graph index, removing
-        // nodes breaks the connectivity the search relies on.)
-        let (flo, fhi) = self.tag_filter.unwrap_or((0, u32::MAX));
-        let filtering = self.tag_filter.is_some() && !self.tags.is_empty();
-        macro_rules! keep {
-            ($slot:expr) => {
-                !filtering || {
-                    let t = self.tags[$slot as usize];
-                    t >= flo && t <= fhi
-                }
-            };
-        }
-        macro_rules! seen {
-            ($slot:expr) => {
-                dedup && {
-                    let s = $slot as usize;
-                    if visited[s] == ep { true } else { visited[s] = ep; false }
-                }
-            };
-        }
-
         // --- 1. centroid scan (single stage, or binary shortlist + exact) ---
         cscores.clear();
         let mut q_coded = false;
         if let Some(t) = self.cent_tree.as_ref() {
             // Tree routing: a beam descent where each level is a contiguous Hamming scan. Work is
             // depth * beam * fanout instead of O(cells) for the flat scan.
+            let mut sub = crate::prof::Lap::start();
             rabitq::rotate(q, &self.rot_signs, rot);
             rabitq::pack_signs_trunc(rot, q_bits);
             q_coded = true;
+            sub.mark(crate::prof::Q_R_ROT);
             let want_c = (nprobe * self.shortlist_mult.max(2)).min(t.n_leaf());
             t.search(q_bits, want_c, tscratch, tout);
-            for &ci in tout.iter() {
+            sub.mark(crate::prof::Q_R_TREE);
+            let pf_rows = self.centroid_sq8 && !self.cent_sq8.is_empty();
+            for (ti, &ci) in tout.iter().enumerate() {
+                if pf_rows && ti + PF_AHEAD < tout.len() {
+                    let nx = tout[ti + PF_AHEAD] as usize * self.dim;
+                    prefetch_bytes(self.cent_sq8[nx..].as_ptr(), self.dim);
+                }
                 if !self.cells[ci as usize].members.is_empty() {
                     // Exact f32 re-order of the shortlist decides probe order,
                     // so the coarse descent only has to get the SET right.
                     cscores.push((ci, self.cent_score(ci as usize, q, cqs, cqbase)));
                 }
             }
+            sub.mark(crate::prof::Q_R_RESCORE);
         } else if let Some(g) = self.cent_graph.as_ref() {
             // Graph routing: greedy descent over the centroid graph instead of scanning every
             // centroid. ef is set wider than nprobe so the beam doesn't collapse onto a local
@@ -1065,24 +1236,19 @@ impl FlatCellIndex {
             rabitq::pack_signs_trunc(rot, q_bits);
             q_coded = true;
             let cl = self.code_len();
-            let mut coarse: Vec<(u32, f32)> = (0..self.cells.len())
-                .map(|i| {
-                    let h = rabitq::hamming(q_bits, self.cent_bits_of(i));
-                    (i as u32, rabitq::hamming_score(h, cl))
-                })
+            // Shortlist = every live cell at or below the want_c-th smallest Hamming distance, ties
+            // included, so the exact re-order decides between tied cells. Same rule as route_batch,
+            // so both routers agree.
+            let hs: Vec<u16> = (0..self.cells.len())
+                .map(|i| rabitq::hamming(q_bits, self.cent_bits_of(i)) as u16)
                 .collect();
-            let want_c = (nprobe * self.shortlist_mult).min(coarse.len());
-            if want_c < coarse.len() {
-                coarse.select_nth_unstable_by(
-                    want_c - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
-                coarse.truncate(want_c);
-            }
-            // Exact re-order of the shortlist only.
-            for (i, _) in coarse.iter() {
-                if self.cells[*i as usize].members.is_empty() {
-                    continue;
+            let n_live = self.cells.iter().filter(|c| !c.members.is_empty()).count();
+            let want_c = (nprobe * self.shortlist_mult).min(n_live);
+            let cut = hamming_cutoff(&hs, |i| !self.cells[i].members.is_empty(), want_c, cl);
+            for (i, &h) in hs.iter().enumerate() {
+                if (h as usize) <= cut && !self.cells[i].members.is_empty() {
+                    cscores.push((i as u32, self.cent_score(i, q, cqs, cqbase)));
                 }
-                cscores.push((*i, self.cent_score(*i as usize, q, cqs, cqbase)));
             }
         } else {
             for (i, c) in self.cells.iter().enumerate() {
@@ -1094,9 +1260,11 @@ impl FlatCellIndex {
                 cscores.push((i as u32, self.cent_score(i, q, cqs, cqbase)));
             }
         }
+        lap.mark(crate::prof::Q_ROUTE);
         let cap = nprobe.min(cscores.len());
         if cap == 0 {
-            return Vec::new();
+            chosen.clear();
+            return q_coded;
         }
         // Partial selection: we only need the top `cap`, not a full sort.
         if cap < cscores.len() {
@@ -1125,6 +1293,165 @@ impl FlatCellIndex {
             }
         }
 
+        lap.mark(crate::prof::Q_SELECT);
+        q_coded
+    }
+
+    /// Step 4 of a query: exact (or highest-precision available) rescoring of
+    /// the scan's survivors, then the final top-k, best first.
+    fn rerank_exact(&self, q: &[f32], cands: &[(f32, u32)], k: usize,
+                    use_par: bool) -> Vec<(f32, u32)> {
+        if cands.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(f32, u32)> = if self.scan_mode == ScanMode::F32 && self.keep_f32 {
+            cands.to_vec()
+        } else if self.f16_rerank {
+            cands
+                .iter()
+                .map(|&(_, slot)| {
+                    let o = slot as usize * self.dim;
+                    (dot_f32_f16(q, &self.rr_f16[o..o + self.dim]), slot)
+                })
+                .collect()
+        } else if self.per_dim_sq {
+            let mut qs = vec![0f32; self.dim];
+            let mut base = 0f32;
+            for j in 0..self.dim {
+                qs[j] = q[j] * self.sq_step[j];
+                base += q[j] * self.sq_min[j];
+            }
+            // Parallelise the rerank too: it's independent per candidate, and at rerank_factor 32
+            // it's 3,200 vectors of 384 B, about as much as the scan. Leaving it sequential capped
+            // the speedup.
+            if use_par {
+                cands
+                    .par_iter()
+                    .map(|&(_, slot)| (base + dot_f32_u8(&qs, self.vec_i8(slot)), slot))
+                    .collect()
+            } else {
+                let mut o = Vec::with_capacity(cands.len());
+                for (i, &(_, slot)) in cands.iter().enumerate() {
+                    if i + PF_AHEAD < cands.len() {
+                        let nx = cands[i + PF_AHEAD].1 as usize * self.dim;
+                        prefetch_bytes(self.scan_i8[nx..].as_ptr() as *const u8, self.dim);
+                    }
+                    o.push((base + dot_f32_u8(&qs, self.vec_i8(slot)), slot));
+                }
+                o
+            }
+        } else if self.i8_rerank {
+            // Asymmetric: query stays f32, documents stay int8.
+            cands
+                .iter()
+                .map(|&(_, slot)| (dot_f32_i8(q, self.vec_i8(slot)), slot))
+                .collect()
+        } else if use_par {
+            cands
+                .par_iter()
+                .map(|&(_, slot)| (dot_f32(q, self.vec_f32(slot)), slot))
+                .collect()
+        } else {
+            // f32 rows are 1.5 KB each and random: prefetch ahead.
+            let mut o = Vec::with_capacity(cands.len());
+            for (i, &(_, slot)) in cands.iter().enumerate() {
+                if i + PF_AHEAD < cands.len() {
+                    let nx = cands[i + PF_AHEAD].1 as usize * self.dim;
+                    prefetch_bytes(self.vecs_f32[nx..].as_ptr() as *const u8, self.dim * 4);
+                }
+                o.push((dot_f32(q, self.vec_f32(slot)), slot));
+            }
+            o
+        };
+        let kk = k.min(out.len());
+        out.select_nth_unstable_by(kk - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+        out.truncate(kk);
+        out.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        out
+    }
+
+    /// Core single-query path.  Returns top-k as (score, slot), best first.
+    fn search_one(
+        &self,
+        q: &[f32],
+        k: usize,
+        nprobe: usize,
+        target_confidence: f32,
+        beta: f32,
+        buf: &mut SearchBuf,
+    ) -> Vec<(f32, u32)> {
+        // disjoint field borrows so the quantized query and the candidate buffer can be held
+        // together 1-2. route: probe list in buf.chosen, scores in buf.cscores
+        let q_coded = self.route_query(q, nprobe, target_confidence, beta, buf);
+        if buf.chosen.is_empty() {
+            return Vec::new();
+        }
+        let SearchBuf { cscores, chosen, cands, q_i8, rot, q_bits, visited, epoch,
+                        hist, hcands, crank, .. } = buf;
+        let mut lap = crate::prof::Lap::start();
+        // Dedup for multi-home vectors is per cell, not per slot: a vector is only scored at the
+        // first of its homes to be scanned, so `visited` stamps cells (M entries, a few KB) instead
+        // of slots (N entries). The per-slot version allocated and zeroed N*4 bytes per query (1 MB
+        // at 250k), which capped batch throughput at ~8k qps no matter what nprobe was.
+        //
+        // Exactly-once rule: a multi-home vector is scored only at the first-ranked of its homes in
+        // this query's probe order. Cells are scanned in probe order, so that home comes first even
+        // if early termination stops the scan. The rule doesn't need any state updated during the
+        // scan, which is what lets the streaming paths use it.
+        let dedup = self.max_assign > 1;
+        if dedup {
+            if visited.len() < self.cells.len() {
+                visited.resize(self.cells.len(), 0);
+                crank.resize(self.cells.len(), 0);
+            }
+            *epoch += 1;
+            if *epoch == u32::MAX {
+                // Wrapped: reset stamps so stale marks cannot alias.
+                for v in visited.iter_mut() { *v = 0; }
+                *epoch = 1;
+            }
+            let ep0 = *epoch;
+            for (r, &c) in chosen.iter().enumerate() {
+                visited[c as usize] = ep0;
+                crank[c as usize] = r as u32;
+            }
+        }
+        let ep = *epoch;
+        // Filter check inside the scan: one u32 compare per member, before the distance is
+        // computed, so a selective filter makes the query cheaper. (In a graph index, removing
+        // nodes breaks the connectivity the search relies on.)
+        let (flo, fhi) = self.tag_filter.unwrap_or((0, u32::MAX));
+        let filtering = self.tag_filter.is_some() && !self.tags.is_empty();
+        macro_rules! keep {
+            ($slot:expr) => {
+                !filtering || {
+                    let t = self.tags[$slot as usize];
+                    t >= flo && t <= fhi
+                }
+            };
+        }
+        // true if `slot` lives in another home cell this query has already scanned (it was scored
+        // there)
+        let ma = self.max_assign;
+        macro_rules! seen {
+            ($slot:expr, $ci:expr) => {
+                dedup && {
+                    let base = $slot as usize * ma;
+                    let rc = crank[$ci as usize];
+                    let mut dup = false;
+                    for j in 0..ma {
+                        let h = self.slot_cells[base + j];
+                        if h != u32::MAX && h != $ci && visited[h as usize] == ep
+                            && crank[h as usize] < rc {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    dup
+                }
+            };
+        }
+
         // --- 2b. reachability bounds for early termination --- bound[i] is the best cosine any
         // member of chosen[i] could have, and suffix_max[i] the best bound over cells i..end. Once
         // the running k-th best beats suffix_max[i], no later cell can contribute and we stop.
@@ -1142,11 +1469,11 @@ impl FlatCellIndex {
             let mut bounds = vec![0.0f32; n];
             for (i, &ci) in chosen.iter().enumerate() {
                 let cell = &self.cells[ci as usize];
-                let cs = cscores
-                    .iter()
-                    .find(|&&(c, _)| c == ci)
-                    .map(|&(_, s)| s)
-                    .unwrap_or(0.0);
+                // `chosen` is a prefix of `cscores` in the same order, so the score is at the same
+                // index. (This was a linear find per cell, O(nprobe^2): 289 us/query at
+                // nprobe=1024.)
+                debug_assert_eq!(cscores[i].0, ci);
+                let cs = cscores[i].1;
                 let ang = cs.clamp(-1.0, 1.0).acos();
                 bounds[i] = (ang - cell.r_bound).max(0.0).cos();
             }
@@ -1155,6 +1482,7 @@ impl FlatCellIndex {
             }
         }
 
+        lap.mark(crate::prof::Q_BOUNDS);
         // --- 3. scan into the reusable candidate buffer ---
         cands.clear();
         let mut threshold = f32::NEG_INFINITY;
@@ -1244,13 +1572,16 @@ impl FlatCellIndex {
                 for (ci_i, &ci) in chosen.iter().enumerate() {
                     for &slot in self.cells[ci as usize].members.iter() {
                         if !keep!(slot) { continue; }
-                        if seen!(slot) { continue; }
+                        if seen!(slot, ci) { continue; }
                         let s = if self.per_dim_sq {
                             qbase + dot_f32_u8(&qs, self.vec_i8(slot))
                         } else {
                             dot_i8(q_i8, self.vec_i8(slot)) as f32
                         };
                         cands.push((s, slot));
+                    }
+                    if dedup {
+                        visited[ci as usize] = ep;
                     }
                     if self.adaptive {
                         // Trim to `want0` so the k-th best score is exact,
@@ -1275,36 +1606,211 @@ impl FlatCellIndex {
                     rabitq::pack_signs_trunc(rot, q_bits);
                 }
                 let dp = self.code_len();
-                for (ci_i, &ci) in chosen.iter().enumerate() {
-                    for &slot in self.cells[ci as usize].members.iter() {
-                        if !keep!(slot) { continue; }
-                        if seen!(slot) { continue; }
-                        let h = rabitq::hamming(q_bits, self.vec_bits(slot));
-                        cands.push((rabitq::hamming_score(h, dp), slot));
-                    }
-                    if self.adaptive {
-                        // Trim to `want0` so the k-th best score is exact,
-                        // then stop if no remaining cell can beat it.
-                        if cands.len() >= 2 * want0 && want0 > 0 {
-                            cands.select_nth_unstable_by(
-                                want0-1, |a, b| b.0.partial_cmp(&a.0).unwrap());
-                            cands.truncate(want0);
-                            threshold = self.score_to_cos(cands[want0-1].0);
+                // Top-want0 selection with an integer bucket queue.
+                //
+                // Hamming distances are in [0, dp], so the want0-th best can be tracked exactly
+                // with a histogram and a falling threshold tau: `kept` counts kept candidates with
+                // h <= tau, and tau drops whenever the candidates strictly below it already fill
+                // want0. Each vector is accepted or rejected with one integer compare and nothing
+                // is sorted during the scan. (The old float path pushed every vector and re-ran
+                // select_nth over 2*want0 entries every ~want0 vectors.)
+                let fs_on = self.fastscan && self.compacted && !self.fs_off.is_empty();
+                let casc = if self.asym_cascade > 0 && !fs_on { self.asym_cascade } else { 1 };
+                let target = (want0 * casc).max(1);
+                if hist.len() < dp + 1 {
+                    hist.resize(dp + 1, 0);
+                }
+                if fs_on {
+                    // FastScan: exact asymmetric table sums per 32-vector block, distance d = maxk
+                    // - sum. The bucket queue runs on d >> 6 (<= 510 buckets, fits in `hist`); the
+                    // exact d then picks the final want0 among the survivors.
+                    let fq = rabitq::FsQuery::new(rot, self.n_words);
+                    let bb = rabitq::fs_block_bytes(self.n_words);
+                    let maxk = fq.maxk;
+                    let norm = (2.0 * self.dim_pad as f32 / std::f32::consts::PI).sqrt();
+                    hcands.clear();
+                    let mut tau = maxk >> 6;
+                    let mut kept = 0usize;
+                    let mut sums = [0u16; rabitq::FS_BLOCK];
+                    for (ci_i, &ci) in chosen.iter().enumerate() {
+                        let mem = &self.cells[ci as usize].members;
+                        let b0 = self.fs_off[ci as usize] as usize;
+                        let b1 = self.fs_off[ci as usize + 1] as usize;
+                        for b in b0..b1 {
+                            fq.block_sums(&self.fs_codes[b * bb..(b + 1) * bb], &mut sums);
+                            let base = (b - b0) * rabitq::FS_BLOCK;
+                            let nv = rabitq::FS_BLOCK.min(mem.len() - base);
+                            for i in 0..nv {
+                                let d = maxk - sums[i] as u32;
+                                let hc = d >> 6;
+                                if hc <= tau {
+                                    let slot = mem[base + i];
+                                    if !keep!(slot) || (dedup && seen!(slot, ci)) {
+                                        continue;
+                                    }
+                                    hcands.push((hc, slot, d as f32));
+                                    hist[hc as usize] += 1;
+                                    kept += 1;
+                                    while tau > 0 && kept - hist[tau as usize] as usize >= target {
+                                        kept -= hist[tau as usize] as usize;
+                                        tau -= 1;
+                                    }
+                                }
+                            }
                         }
-                        if threshold > f32::NEG_INFINITY
-                            && suffix[ci_i + 1] < threshold - self.at_margin
-                        {
+                        if hcands.len() > 4 * target + 1024 {
+                            let t = tau;
+                            hcands.retain(|&(h, _, _)| h <= t);
+                        }
+                        if self.adaptive && kept >= target {
+                            let worst = maxk.saturating_sub(((tau + 1) << 6) - 1);
+                            threshold = (fq.estimate(worst) / norm).clamp(-1.0, 1.0);
+                            if suffix[ci_i + 1] < threshold - self.at_margin {
+                                break;
+                            }
+                        }
+                    }
+                    cands.clear();
+                    for &(h, slot, d) in hcands.iter() {
+                        if h <= tau {
+                            cands.push((-d, slot));
+                        }
+                    }
+                    for x in hist[..=dp].iter_mut() {
+                        *x = 0;
+                    }
+                    if want0 > 0 && cands.len() > want0 {
+                        cands.select_nth_unstable_by(want0-1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                        cands.truncate(want0);
+                    }
+                } else {
+                hcands.clear();
+                let mut tau = dp as u32;
+                let mut kept = 0usize;
+                let nw = self.n_words;
+                let poly_runs = dedup && !self.rep_off.is_empty();
+                let stream = self.compacted && !filtering && (!dedup || poly_runs);
+                // Asymmetric score, computed only for codes that pass the
+                // Hamming cut-off and while the code is still in L1.
+                let aq = if casc > 1 { Some(rabitq::AsymQuery::new(rot, nw)) } else { None };
+                macro_rules! offer {
+                    ($h:expr, $slot:expr, $code:expr) => {{
+                        let h: u32 = $h;
+                        if h <= tau {
+                            let a = match &aq { Some(a) => a.score($code), None => 0.0 };
+                            hcands.push((h, $slot, a));
+                            hist[h as usize] += 1;
+                            kept += 1;
+                            while tau > 0 && kept - hist[tau as usize] as usize >= target {
+                                kept -= hist[tau as usize] as usize;
+                                tau -= 1;
+                            }
+                        }
+                    }};
+                }
+                for (ci_i, &ci) in chosen.iter().enumerate() {
+                    let mem = &self.cells[ci as usize].members;
+                    if stream && ci_i + 1 < chosen.len() {
+                        // Next cell's run: warm its first lines so the
+                        // hardware prefetcher has a stream to follow.
+                        let nc = chosen[ci_i + 1] as usize;
+                        let nm = &self.cells[nc].members;
+                        if !nm.is_empty() && (!poly_runs || self.prim_len[nc] > 0) {
+                            let o = nm[0] as usize * nw;
+                            prefetch_bytes(self.bits[o..].as_ptr() as *const u8,
+                                           (nm.len() * nw * 8).min(1024));
+                        }
+                    }
+                    if stream && poly_runs && !mem.is_empty() {
+                        // Polysemic runs: primary run from the arena, replica run from rep_bits,
+                        // both sequential. The exactly-once check only runs for codes that pass the
+                        // cut-off (a code rejected here is rejected at every home: same code, and
+                        // the cut-off only goes down).
+                        let np = self.prim_len[ci as usize] as usize;
+                        if np > 0 {
+                            let s0 = mem[0] as usize;
+                            let run = &self.bits[s0 * nw..(s0 + np) * nw];
+                            for (i, code) in run.chunks_exact(nw).enumerate() {
+                                let h = rabitq::hamming(q_bits, code);
+                                if h <= tau {
+                                    let slot = (s0 + i) as u32;
+                                    if !seen!(slot, ci) {
+                                        offer!(h, slot, code);
+                                    }
+                                }
+                            }
+                        }
+                        let r0 = self.rep_off[ci as usize] as usize;
+                        let r1 = self.rep_off[ci as usize + 1] as usize;
+                        let rrun = &self.rep_bits[r0 * nw..r1 * nw];
+                        for (j, code) in rrun.chunks_exact(nw).enumerate() {
+                            let h = rabitq::hamming(q_bits, code);
+                            if h <= tau {
+                                let slot = mem[np + j];
+                                if !seen!(slot, ci) {
+                                    offer!(h, slot, code);
+                                }
+                            }
+                        }
+                    } else if stream && !mem.is_empty() {
+                        // Compacted: the cell is one run of consecutive slots, so its codes are one
+                        // contiguous slice. Read it directly, without going through the member
+                        // list.
+                        let s0 = mem[0] as usize;
+                        let run = &self.bits[s0 * nw..(s0 + mem.len()) * nw];
+                        for (i, code) in run.chunks_exact(nw).enumerate() {
+                            offer!(rabitq::hamming(q_bits, code), (s0 + i) as u32, code);
+                        }
+                    } else {
+                        for &slot in mem.iter() {
+                            if !keep!(slot) { continue; }
+                            if seen!(slot, ci) { continue; }
+                            let code = self.vec_bits(slot);
+                            offer!(rabitq::hamming(q_bits, code), slot, code);
+                        }
+                    }
+                    if dedup {
+                        visited[ci as usize] = ep;
+                    }
+                    if hcands.len() > 4 * target + 1024 {
+                        let t = tau;
+                        hcands.retain(|&(h, _, _)| h <= t);
+                    }
+                    if self.adaptive && kept >= target {
+                        // tau IS the want0-th best distance: stop once no
+                        // remaining cell can beat it.
+                        threshold = self.score_to_cos(rabitq::hamming_score(tau, dp));
+                        if suffix[ci_i + 1] < threshold - self.at_margin {
                             break;
                         }
                     }
+                }
+                cands.clear();
+                for &(h, slot, a) in hcands.iter() {
+                    if h <= tau {
+                        let sc = if casc > 1 { a } else { rabitq::hamming_score(h, dp) };
+                        cands.push((sc, slot));
+                    }
+                }
+                for x in hist[..=dp].iter_mut() {
+                    *x = 0;
+                }
+                if casc > 1 && want0 > 0 && cands.len() > want0 {
+                    // Asymmetric stage: scores were computed in the scan.
+                    cands.select_nth_unstable_by(want0-1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    cands.truncate(want0);
+                }
                 }
             }
             ScanMode::F32 => {
                 for (ci_i, &ci) in chosen.iter().enumerate() {
                     for &slot in self.cells[ci as usize].members.iter() {
                         if !keep!(slot) { continue; }
-                        if seen!(slot) { continue; }
+                        if seen!(slot, ci) { continue; }
                         cands.push((dot_f32(q, self.vec_f32(slot)), slot));
+                    }
+                    if dedup {
+                        visited[ci as usize] = ep;
                     }
                     if self.adaptive {
                         // Trim to `want0` so the k-th best score is exact,
@@ -1327,69 +1833,474 @@ impl FlatCellIndex {
 
         }
 
-        // --- 4. top-k, with exact rerank when the scan was quantized ---
+        lap.mark(crate::prof::Q_SCAN);
+        // --- 4. top-k, with exact rerank when the scan was quantized --- The bucket queue already
+        // kept exactly the candidates at or below the cut-off, ties included, so the exact rerank
+        // decides between ties rather than encounter order.
+        let ties_kept = self.scan_mode == ScanMode::Binary && !use_par;
         let want = want0.min(cands.len());
         if want == 0 {
             return Vec::new();
         }
-        if want < cands.len() {
+        if want < cands.len() && !ties_kept {
             cands.select_nth_unstable_by(want - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
             cands.truncate(want);
         }
 
-        let mut out: Vec<(f32, u32)> = if self.scan_mode == ScanMode::F32 && self.keep_f32 {
-            cands.clone()
-        } else if self.f16_rerank {
-            cands
-                .iter()
-                .map(|&(_, slot)| {
-                    let o = slot as usize * self.dim;
-                    (dot_f32_f16(q, &self.rr_f16[o..o + self.dim]), slot)
-                })
-                .collect()
-        } else if self.per_dim_sq {
-            let mut qs = vec![0f32; self.dim];
-            let mut base = 0f32;
-            for j in 0..self.dim {
-                qs[j] = q[j] * self.sq_step[j];
-                base += q[j] * self.sq_min[j];
-            }
-            // Parallelise the rerank too: it's independent per candidate, and at rerank_factor 32
-            // it's 3,200 vectors of 384 B, about as much as the scan. Leaving it sequential capped
-            // the speedup.
-            if use_par {
-                cands
-                    .par_iter()
-                    .map(|&(_, slot)| (base + dot_f32_u8(&qs, self.vec_i8(slot)), slot))
-                    .collect()
-            } else {
-                cands
-                    .iter()
-                    .map(|&(_, slot)| (base + dot_f32_u8(&qs, self.vec_i8(slot)), slot))
-                    .collect()
-            }
-        } else if self.i8_rerank {
-            // Asymmetric: query stays f32, documents stay int8.
-            cands
-                .iter()
-                .map(|&(_, slot)| (dot_f32_i8(q, self.vec_i8(slot)), slot))
-                .collect()
-        } else if use_par {
-            cands
-                .par_iter()
-                .map(|&(_, slot)| (dot_f32(q, self.vec_f32(slot)), slot))
-                .collect()
-        } else {
-            cands
-                .iter()
-                .map(|&(_, slot)| (dot_f32(q, self.vec_f32(slot)), slot))
-                .collect()
-        };
-        let kk = k.min(out.len());
-        out.select_nth_unstable_by(kk - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
-        out.truncate(kk);
-        out.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        lap.mark(crate::prof::Q_TOPK);
+        let out = self.rerank_exact(q, cands, k, use_par);
+        lap.mark(crate::prof::Q_RERANK);
+        if crate::prof::on() {
+            crate::prof::add(crate::prof::Q_COUNT, 1);
+        }
         out
+    }
+
+    /// Batch routing: exact flat Hamming ranking of every query against every cell code, in
+    /// cache-blocked tiles, then the same SQ8 rescore and nucleus rule as route_query.
+    ///
+    /// For one query the tree is cheaper than a flat scan; for a batch it isn't. A block of QB
+    /// queries' codes stays in L1 while the centroid codes stream through once per block, so each
+    /// (query, cell) Hamming costs about a nanosecond, and the ranking is exact instead of a beam
+    /// approximation. Returns None if two-stage codes aren't available.
+    fn route_batch(&self, data: &[f32], nprobe: usize, target_confidence: f32,
+                   beta: f32) -> Option<Vec<(Vec<u64>, Vec<u32>, Vec<f32>)>> {
+        if !self.two_stage || self.cent_bits.is_empty() {
+            return None;
+        }
+        const QB: usize = 32;
+        let dim = self.dim;
+        let nw = self.n_words;
+        let nq = data.len() / dim;
+        let m = self.cells.len();
+        let cl = self.code_len();
+        let live: Vec<bool> = self.cells.iter().map(|c| !c.members.is_empty()).collect();
+        let n_live = live.iter().filter(|&&x| x).count();
+        let want_c = (nprobe * self.shortlist_mult.max(2)).min(n_live);
+        if want_c == 0 {
+            return Some(vec![(vec![0u64; nw], Vec::new(), Vec::new()); nq]);
+        }
+
+        // 1. Query codes.
+        let mut qbits = vec![0u64; nq * nw];
+        qbits
+            .par_chunks_mut(nw)
+            .zip(data.par_chunks(dim))
+            .for_each_init(|| vec![0f32; self.dim_pad], |rot, (out, q)| {
+                rabitq::rotate(q, &self.rot_signs, rot);
+                rabitq::pack_signs_trunc(rot, out);
+            });
+
+        // 2. Blocked exact Hamming + integer counting selection of want_c.
+        let qids: Vec<usize> = (0..nq).collect();
+        let shortlists: Vec<Vec<u32>> = qids
+            .par_chunks(QB)
+            .flat_map_iter(|blk| {
+                let b = blk.len();
+                let mut hs = vec![0u16; b * m];
+                for c in 0..m {
+                    let cc = &self.cent_bits[c * nw..(c + 1) * nw];
+                    for (bi, &qi) in blk.iter().enumerate() {
+                        hs[bi * m + c] =
+                            rabitq::hamming(&qbits[qi * nw..(qi + 1) * nw], cc) as u16;
+                    }
+                }
+                let mut res = Vec::with_capacity(b);
+                for bi in 0..b {
+                    let row = &hs[bi * m..(bi + 1) * m];
+                    let cut = hamming_cutoff(row, |c| live[c], want_c, cl);
+                    let sl: Vec<u32> = (0..m)
+                        .filter(|&c| live[c] && (row[c] as usize) <= cut)
+                        .map(|c| c as u32)
+                        .collect();
+                    res.push(sl);
+                }
+                res.into_iter()
+            })
+            .collect();
+
+        // 3. Exact SQ8 rescore of each shortlist + nucleus (as route_query).
+        let cent_q8 = self.centroid_sq8 && !self.cent_sq8.is_empty();
+        let out: Vec<(Vec<u64>, Vec<u32>, Vec<f32>)> = (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let q = &data[qi * dim..(qi + 1) * dim];
+                let mut cqs = vec![0f32; dim];
+                let mut cqbase = 0f32;
+                if cent_q8 {
+                    for j in 0..dim {
+                        cqs[j] = q[j] * self.csq_step[j];
+                        cqbase += q[j] * self.csq_min[j];
+                    }
+                }
+                let sl = &shortlists[qi];
+                let mut cs: Vec<(u32, f32)> = Vec::with_capacity(sl.len());
+                for (ti, &ci) in sl.iter().enumerate() {
+                    if cent_q8 && ti + PF_AHEAD < sl.len() {
+                        let nx = sl[ti + PF_AHEAD] as usize * dim;
+                        prefetch_bytes(self.cent_sq8[nx..].as_ptr(), dim);
+                    }
+                    cs.push((ci, self.cent_score(ci as usize, q, &cqs, cqbase)));
+                }
+                let cap = nprobe.min(cs.len());
+                let mut chosen = Vec::with_capacity(cap);
+                if cap > 0 {
+                    if cap < cs.len() {
+                        cs.select_nth_unstable_by(cap - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                        cs.truncate(cap);
+                    }
+                    cs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    if target_confidence >= 1.0 {
+                        chosen.extend(cs.iter().map(|&(i, _)| i));
+                    } else {
+                        let max_s = cs[0].1;
+                        let z: f32 = cs.iter().map(|&(_, s)| ((s - max_s) * beta).exp()).sum();
+                        let mut cum = 0.0f32;
+                        for &(i, s) in cs.iter() {
+                            chosen.push(i);
+                            cum += ((s - max_s) * beta).exp() / (z + 1e-9);
+                            if cum >= target_confidence {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let sc: Vec<f32> = cs.iter().take(chosen.len()).map(|&(_, x)| x).collect();
+                (qbits[qi * nw..(qi + 1) * nw].to_vec(), chosen, sc)
+            })
+            .collect();
+        Some(out)
+    }
+
+    /// Cell-major batch search: the scan is done as a join between the batch's queries and the
+    /// cells they probe.
+    ///
+    /// Per-query execution reads every probed cell from memory once per query, Q*P cell reads per
+    /// batch. Here every query is routed first (same routing as search_one), the probe lists are
+    /// inverted to cell -> queries, and each worker reads its range of cells once, scoring every
+    /// interested query while the cell's codes are in L1. Memory traffic drops from Q*P cells to at
+    /// most M; the compute (one distance per (query, vector) pair) is the same. A graph search
+    /// can't be reorganised like this because each step depends on the previous one.
+    ///
+    /// Result set: for each query every chosen cell is scanned and the top k*rerank_factor by
+    /// Hamming are kept, then the same exact rerank as the per-query path.
+    ///
+    /// Each worker keeps its own top-`target` per query. Any worker's target-th best distance is a
+    /// valid global cut-off (it already holds `target` candidates at or below it), so workers share
+    /// a per-query atomic minimum. That keeps the merge small without changing which candidates can
+    /// win.
+    fn search_batch_cellmajor(&self, data: &[f32], k: usize, nprobe: usize,
+                              target_confidence: f32, beta: f32) -> Vec<Vec<(f32, u32)>> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dim = self.dim;
+        let nw = self.n_words;
+        let nq = data.len() / dim;
+        let fs_on = self.fastscan && !self.fs_off.is_empty();
+        let bb = rabitq::fs_block_bytes(nw);
+        // Distances: Hamming in [0, code_len], or FastScan maxk - sum.
+        let dp = if fs_on { 255 * nw * 16 } else { self.code_len() };
+        let want_final = (k * self.rerank_factor).max(1);
+        let casc = if self.asym_cascade > 0 && !fs_on { self.asym_cascade } else { 1 };
+        let target = want_final * casc;
+
+        // 1. Route every query (in parallel) and seed it by scanning its SEED_CELLS best cells
+        //    right away. Those cells already hold well over `target` candidates, so the seed fixes
+        //    a tight, valid cut-off tau before the cell-major pass, which then rejects nearly every
+        //    vector with one integer compare. (Without a seed each worker only sees a few of a
+        //    query's cells, in arena order, and never learns a cut-off.)
+        const SEED_CELLS: usize = 8;
+        struct Routed {
+            bits: Vec<u64>,
+            rest: Vec<u32>,
+            seed: Vec<(u32, u32, f32)>,
+            tau: u32,
+            /// Asymmetric query (cascade only).
+            aq: Option<rabitq::AsymQuery>,
+            /// FastScan tables (fastscan only).
+            fq: Option<rabitq::FsQuery>,
+            /// Probed-cell bitset (multi-home only).
+            probed: Vec<u64>,
+        }
+        // Exactly-once rule in cell-major order (every probed cell is scanned in full, in no
+        // particular order): score a multi-home vector only at its lowest-id probed home.
+        let ma = self.max_assign;
+        let poly = ma > 1;
+        let mwords = (self.cells.len() + 63) / 64;
+        let canonical = |slot: u32, ci: u32, probed: &[u64]| -> bool {
+            let base = slot as usize * ma;
+            for j in 0..ma {
+                let h = self.slot_cells[base + j];
+                if h != u32::MAX && h < ci && (probed[h as usize >> 6] >> (h & 63)) & 1 == 1 {
+                    return false;
+                }
+            }
+            true
+        };
+        // One cell for one query: primaries (+ replicas when polysemic),
+        // calling `f(h, slot)` for every code that passes the cut-off `t()`.
+        let scan_cell = |c: usize, qb: &[u64], aq: &Option<rabitq::AsymQuery>,
+                         fq: &Option<rabitq::FsQuery>,
+                         probed: &[u64], t: &mut u32, out: &mut Vec<(u32, u32, f32)>| {
+            let asym = |code: &[u64]| match aq { Some(a) => a.score(code), None => 0.0 };
+            let mem = &self.cells[c].members;
+            if mem.is_empty() {
+                return;
+            }
+            if let Some(fq) = fq {
+                let b0 = self.fs_off[c] as usize;
+                let b1 = self.fs_off[c + 1] as usize;
+                let mut sums = [0u16; rabitq::FS_BLOCK];
+                for b in b0..b1 {
+                    fq.block_sums(&self.fs_codes[b * bb..(b + 1) * bb], &mut sums);
+                    let base = (b - b0) * rabitq::FS_BLOCK;
+                    let nv = rabitq::FS_BLOCK.min(mem.len() - base);
+                    for i in 0..nv {
+                        let d = fq.maxk - sums[i] as u32;
+                        if d <= *t {
+                            let slot = mem[base + i];
+                            if !poly || canonical(slot, c as u32, probed) {
+                                out.push((d, slot, 0.0));
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            let np = if poly { self.prim_len[c] as usize } else { mem.len() };
+            if np > 0 {
+                let s0 = mem[0] as usize;
+                let run = &self.bits[s0 * nw..(s0 + np) * nw];
+                for (i, code) in run.chunks_exact(nw).enumerate() {
+                    let h = rabitq::hamming(qb, code);
+                    if h <= *t {
+                        let slot = (s0 + i) as u32;
+                        if !poly || canonical(slot, c as u32, probed) {
+                            out.push((h, slot, asym(code)));
+                        }
+                    }
+                }
+            }
+            if poly {
+                let r0 = self.rep_off[c] as usize;
+                let r1 = self.rep_off[c + 1] as usize;
+                let rrun = &self.rep_bits[r0 * nw..r1 * nw];
+                for (j, code) in rrun.chunks_exact(nw).enumerate() {
+                    let h = rabitq::hamming(qb, code);
+                    if h <= *t {
+                        let slot = mem[np + j];
+                        if canonical(slot, c as u32, probed) {
+                            out.push((h, slot, asym(code)));
+                        }
+                    }
+                }
+            }
+        };
+        let probes: Vec<(Vec<u64>, Vec<u32>, Vec<f32>)> =
+            match self.route_batch(data, nprobe, target_confidence, beta) {
+                Some(r) => r,
+                None => data
+                    .par_chunks_exact(dim)
+                    .map_init(
+                        || SearchBuf::new(dim, self.dim_pad, nw),
+                        |buf, q| {
+                            let coded =
+                                self.route_query(q, nprobe, target_confidence, beta, buf);
+                            if !coded {
+                                rabitq::rotate(q, &self.rot_signs, &mut buf.rot);
+                                rabitq::pack_signs_trunc(&buf.rot, &mut buf.q_bits);
+                            }
+                            let sc: Vec<f32> = buf.cscores.iter().take(buf.chosen.len())
+                                .map(|&(_, x)| x).collect();
+                            (buf.q_bits.clone(), buf.chosen.clone(), sc)
+                        },
+                    )
+                    .collect(),
+            };
+        let routed: Vec<Routed> = probes
+            .into_par_iter()
+            .enumerate()
+            .map(|(qi, (qbits, chosen, cscore))| {
+                    let ns = SEED_CELLS.min(chosen.len());
+                    let mut probed: Vec<u64> = Vec::new();
+                    if poly {
+                        probed = vec![0u64; mwords];
+                        for &c in chosen.iter() {
+                            probed[c as usize >> 6] |= 1u64 << (c & 63);
+                        }
+                    }
+                    let (aq, fq) = if casc > 1 || fs_on {
+                        let q = &data[qi * dim..(qi + 1) * dim];
+                        let mut rot = vec![0f32; self.dim_pad];
+                        rabitq::rotate(q, &self.rot_signs, &mut rot);
+                        if fs_on {
+                            (None, Some(rabitq::FsQuery::new(&rot, nw)))
+                        } else {
+                            (Some(rabitq::AsymQuery::new(&rot, nw)), None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    let mut seed: Vec<(u32, u32, f32)> = Vec::new();
+                    let mut t_all = dp as u32;
+                    for &c in chosen[..ns].iter() {
+                        scan_cell(c as usize, &qbits, &aq, &fq, &probed, &mut t_all, &mut seed);
+                    }
+                    let mut tau = dp as u32;
+                    if seed.len() >= target {
+                        let (_, kth, _) = seed.select_nth_unstable_by_key(target - 1, |e| e.0);
+                        tau = kth.0;
+                        seed.retain(|e| e.0 <= tau);
+                    }
+                    // Adaptive pruning, same rule as the per-query path: the seed's target-th best
+                    // is a valid lower bound on the final cut-off score, and a cell whose
+                    // reachability bound (centroid angle minus its p99 radius) can't reach it,
+                    // minus the margin, can't contribute. Cut the probe list at the first point
+                    // where no later cell can.
+                    let mut rest_end = chosen.len();
+                    if self.adaptive && seed.len() >= target && ns < chosen.len() {
+                        let thr = if let Some(f) = &fq {
+                            let norm = (2.0 * self.dim_pad as f32 / std::f32::consts::PI).sqrt();
+                            (f.estimate(f.maxk - tau) / norm).clamp(-1.0, 1.0)
+                        } else {
+                            self.score_to_cos(rabitq::hamming_score(tau, self.code_len()))
+                        };
+                        let m = chosen.len();
+                        let mut suffix = vec![f32::NEG_INFINITY; m + 1];
+                        for i in (ns..m).rev() {
+                            let cell = &self.cells[chosen[i] as usize];
+                            let ang = cscore[i].clamp(-1.0, 1.0).acos();
+                            let b = (ang - cell.r_bound).max(0.0).cos();
+                            suffix[i] = b.max(suffix[i + 1]);
+                        }
+                        for i in ns..m {
+                            if suffix[i] < thr - self.at_margin {
+                                rest_end = i;
+                                break;
+                            }
+                        }
+                    }
+                    Routed { rest: chosen[ns..rest_end].to_vec(), bits: qbits, seed, tau, probed, aq, fq }
+            })
+            .collect();
+
+        // 2. Invert: cell -> queries (counting sort, queries ascending).
+        let m = self.cells.len();
+        let mut start = vec![0usize; m + 1];
+        for r in routed.iter() {
+            for &c in r.rest.iter() {
+                start[c as usize + 1] += 1;
+            }
+        }
+        for c in 0..m {
+            start[c + 1] += start[c];
+        }
+        let mut qof = vec![0u32; start[m]];
+        {
+            let mut pos = start.clone();
+            for (qi, r) in routed.iter().enumerate() {
+                for &c in r.rest.iter() {
+                    qof[pos[c as usize]] = qi as u32;
+                    pos[c as usize] += 1;
+                }
+            }
+        }
+
+        // 3. Contiguous cell ranges of ~equal work (members x interested queries).
+        let ntask = rayon::current_num_threads().max(1) * 4;
+        let work: Vec<usize> = (0..m)
+            .map(|c| self.cells[c].members.len() * (start[c + 1] - start[c]))
+            .collect();
+        let total: usize = work.iter().sum::<usize>().max(1);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ntask);
+        let (mut c0, mut acc) = (0usize, 0usize);
+        for c in 0..m {
+            acc += work[c];
+            if acc * ntask >= total * (ranges.len() + 1) || c + 1 == m {
+                ranges.push((c0, c + 1));
+                c0 = c + 1;
+            }
+        }
+
+        // 4. Scan.  Per-worker, per-query top-`target` buffers; shared
+        //    per-query rejection threshold.
+        let gtau: Vec<AtomicU32> = routed.iter().map(|r| AtomicU32::new(r.tau)).collect();
+        let partials: Vec<Vec<Vec<(u32, u32, f32)>>> = ranges
+            .par_iter()
+            .map(|&(a, b)| {
+                let mut bufs: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); nq];
+                let mut ltau: Vec<u32> = vec![dp as u32; nq];
+                for c in a..b {
+                    let qs = &qof[start[c]..start[c + 1]];
+                    let mem = &self.cells[c].members;
+                    if qs.is_empty() || mem.is_empty() {
+                        continue;
+                    }
+                    for &qi in qs.iter() {
+                        let qi = qi as usize;
+                        let qb = &routed[qi].bits[..];
+                        let bq = &mut bufs[qi];
+                        let mut t = ltau[qi].min(gtau[qi].load(Ordering::Relaxed));
+                        let before = bq.len();
+                        scan_cell(c, qb, &routed[qi].aq, &routed[qi].fq, &routed[qi].probed, &mut t, bq);
+                        if bq.len() > before {
+                            {
+                                if bq.len() >= 2 * target || (bq.len() >= target && t == dp as u32) {
+                                    // New cut-off = this worker's target-th best;
+                                    // keep everything at or below it (ties too).
+                                    let (_, kth, _) =
+                                        bq.select_nth_unstable_by_key(target - 1, |e| e.0);
+                                    t = t.min(kth.0);
+                                    let tt = t;
+                                    bq.retain(|e| e.0 <= tt);
+                                }
+                            }
+                        }
+                        if bq.len() >= target {
+                            // t is an upper bound on this worker's target-th
+                            // best, hence on the global one: publish it.
+                            gtau[qi].fetch_min(t, Ordering::Relaxed);
+                        }
+                        ltau[qi] = t;
+                    }
+                }
+                bufs
+            })
+            .collect();
+
+        // 5. Per query: merge, keep the global top-`target`, exact rerank.
+        (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let t = gtau[qi].load(Ordering::Relaxed);
+                let mut v: Vec<(u32, u32, f32)> =
+                    routed[qi].seed.iter().copied().filter(|e| e.0 <= t).collect();
+                for p in partials.iter() {
+                    v.extend(p[qi].iter().filter(|e| e.0 <= t));
+                }
+                if v.len() > target {
+                    // Exact global cut-off; keep every tie at it, as the
+                    // per-query path does.
+                    let (_, kth, _) = v.select_nth_unstable_by_key(target - 1, |e| e.0);
+                    let cut = kth.0;
+                    v.retain(|e| e.0 <= cut);
+                }
+                let q = &data[qi * dim..(qi + 1) * dim];
+                let cands: Vec<(f32, u32)> = if casc > 1 && v.len() > want_final {
+                    // Asymmetric scores were computed in the scan.
+                    let mut sc: Vec<(f32, u32)> = v.iter().map(|&(_, slot, a)| (a, slot)).collect();
+                    sc.select_nth_unstable_by(want_final - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    sc.truncate(want_final);
+                    sc
+                } else {
+                    if fs_on {
+                        v.iter().map(|&(d, slot, _)| (-(d as f32), slot)).collect()
+                    } else {
+                        v.iter().map(|&(h, slot, _)| (rabitq::hamming_score(h, dp), slot)).collect()
+                    }
+                };
+                self.rerank_exact(q, &cands, k, false)
+            })
+            .collect()
     }
 
     /// Search from Rust without a Python token.
@@ -1454,6 +2365,15 @@ impl FlatCellIndex {
             n_live: 0,
             max_assign: self.max_assign,
             spill_margin: self.spill_margin,
+            spill_lambda: self.spill_lambda,
+            compacted: false,
+            asym_cascade: 0,
+            fastscan: false,
+            fs_codes: Vec::new(),
+            fs_off: Vec::new(),
+            prim_len: Vec::new(),
+            rep_off: Vec::new(),
+            rep_bits: Vec::new(),
             slot_cells: Vec::new(),
             tags: Vec::new(),
             tag_filter: None,
@@ -1539,6 +2459,9 @@ impl FlatCellIndex {
             }
             return vec![best.0];
         }
+        if self.spill_lambda > 0.0 {
+            return self.pick_orthogonal(&mut sc.scored);
+        }
         let r = self.max_assign.min(sc.scored.len());
         sc.scored.select_nth_unstable_by(r - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
         sc.scored.truncate(r);
@@ -1563,6 +2486,9 @@ impl FlatCellIndex {
             }
             return vec![best.0];
         }
+        if self.spill_lambda > 0.0 {
+            return self.pick_orthogonal(&mut scored);
+        }
         let r = self.max_assign.min(scored.len());
         scored.select_nth_unstable_by(r - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
         scored.truncate(r);
@@ -1573,6 +2499,164 @@ impl FlatCellIndex {
             .filter(|&(_, s)| s >= cutoff)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Orthogonal polysemy: pick max_assign homes for one vector.
+    ///
+    /// `scored` holds candidate cells with their exact score v . mu. The first home is the nearest
+    /// cell. Each further home minimises
+    ///
+    /// ```text
+    ///   ||r'||^2 + lambda * sum_h (r' . r_h / ||r_h||)^2,   r = v - mu
+    /// ```
+    ///
+    /// over the ORTHO_POOL best candidates, so it's close to the vector but its residual is
+    /// orthogonal to the residuals already chosen. On unit vectors everything reduces to dot
+    /// products: ||r||^2 = 2 - 2 v.mu and r_j . r_h = 1 - v.mu_j - v.mu_h + mu_j.mu_h.
+    fn pick_orthogonal(&self, scored: &mut Vec<(u32, f32)>) -> Vec<u32> {
+        const ORTHO_POOL: usize = 16;
+        let pool = ORTHO_POOL.min(scored.len());
+        if pool < scored.len() {
+            scored.select_nth_unstable_by(pool - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+            scored.truncate(pool);
+        }
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let r = self.max_assign.min(scored.len());
+        let mut homes: Vec<(u32, f32)> = vec![scored[0]];
+        let mut taken = vec![false; scored.len()];
+        taken[0] = true;
+        while homes.len() < r {
+            let mut best = (usize::MAX, f32::INFINITY);
+            for (j, &(cj, sj)) in scored.iter().enumerate() {
+                if taken[j] {
+                    continue;
+                }
+                let mut loss = 2.0-2.0 * sj;
+                for &(ch, sh) in homes.iter() {
+                    let rn = (2.0-2.0 * sh).max(1e-12).sqrt();
+                    let g = dot_f32(&self.cells[ch as usize].centroid,
+                                    &self.cells[cj as usize].centroid);
+                    let p = (1.0 - sh - sj + g) / rn;
+                    loss += self.spill_lambda * p * p;
+                }
+                if loss < best.1 {
+                    best = (j, loss);
+                }
+            }
+            if best.0 == usize::MAX {
+                break;
+            }
+            taken[best.0] = true;
+            homes.push(scored[best.0]);
+        }
+        homes.into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// Bulk append: grow every arena once, encode all vectors in parallel straight into their
+    /// slots, then do the bookkeeping serially in input order. Gives exactly the same index as the
+    /// serial loop (same slots, codes, member order and centroid sums; sums are accumulated per
+    /// cell in input order, in parallel over cells). The serial loop was 51% of a 1M build.
+    fn append_parallel(&mut self, ids: &[u64], data: &[f32], asg: &[Vec<u32>]) {
+        let n = ids.len();
+        let dim = self.dim;
+        let nw = self.n_words;
+        let base = self.ext_ids.len();
+        let store_bits = self.scan_mode == ScanMode::Binary;
+        let store_i8 = self.scan_mode == ScanMode::I8
+            || (self.scan_mode == ScanMode::Binary && self.i8_rerank);
+        let store_f16 = self.scan_mode == ScanMode::Binary && self.f16_rerank;
+        if self.keep_f32 {
+            self.vecs_f32.extend_from_slice(data);
+        }
+        let rot_signs = &self.rot_signs;
+        let (sq_min, sq_step, qscale) = (&self.sq_min, &self.sq_step, self.quant_scale);
+        let per_dim = self.per_dim_sq;
+        let dim_pad = self.dim_pad;
+        if store_bits {
+            self.bits.resize((base + n) * nw, 0);
+            self.bits[base * nw..]
+                .par_chunks_mut(nw)
+                .zip(data.par_chunks(dim))
+                .for_each_init(|| vec![0f32; dim_pad], |rot, (out, v)| {
+                    rabitq::rotate(v, rot_signs, rot);
+                    rabitq::pack_signs_trunc(rot, out);
+                });
+        }
+        if store_i8 {
+            self.scan_i8.resize((base + n) * dim, 0);
+            self.scan_i8[base * dim..]
+                .par_chunks_mut(dim)
+                .zip(data.par_chunks(dim))
+                .for_each(|(out, v)| {
+                    if per_dim {
+                        for j in 0..dim {
+                            out[j] = (((v[j] - sq_min[j]) / sq_step[j])
+                                .round()
+                                .clamp(0.0, 255.0) as u8) as i8;
+                        }
+                    } else {
+                        for j in 0..dim {
+                            out[j] = (v[j] * qscale).round().clamp(-127.0, 127.0) as i8;
+                        }
+                    }
+                });
+        }
+        if store_f16 {
+            self.rr_f16.resize((base + n) * dim, 0);
+            self.rr_f16[base * dim..]
+                .par_chunks_mut(dim)
+                .zip(data.par_chunks(dim))
+                .for_each(|(out, v)| {
+                    for j in 0..dim {
+                        out[j] = f32_to_f16(v[j]);
+                    }
+                });
+        }
+
+        // Bookkeeping, in input order: slot = base + i.
+        let ma = self.max_assign;
+        self.ext_ids.extend_from_slice(ids);
+        self.slot_cell.extend(asg.iter().map(|a| a[0]));
+        self.slot_cells.reserve(n * ma);
+        for a in asg {
+            for j in 0..ma {
+                self.slot_cells.push(a.get(j).copied().unwrap_or(u32::MAX));
+            }
+        }
+        self.id_to_slot.reserve(n);
+        for (i, a) in asg.iter().enumerate() {
+            let slot = (base + i) as u32;
+            for &ci in a.iter() {
+                self.cells[ci as usize].members.push(slot);
+            }
+            self.id_to_slot.insert(ids[i], slot);
+        }
+        self.n_live += n;
+
+        // Primary centroid sums, parallel over cells, input order within a cell.
+        let m = self.cells.len();
+        let mut start = vec![0usize; m + 1];
+        for a in asg {
+            start[a[0] as usize + 1] += 1;
+        }
+        for c in 0..m {
+            start[c + 1] += start[c];
+        }
+        let mut pos = start.clone();
+        let mut order = vec![0u32; n];
+        for (i, a) in asg.iter().enumerate() {
+            let c = a[0] as usize;
+            order[pos[c]] = i as u32;
+            pos[c] += 1;
+        }
+        self.cells.par_iter_mut().enumerate().for_each(|(c, cell)| {
+            for &i in &order[start[c]..start[c + 1]] {
+                let v = &data[i as usize * dim..(i as usize + 1) * dim];
+                for (sv, &x) in cell.sum.iter_mut().zip(v) {
+                    *sv += x;
+                }
+            }
+        });
     }
 }
 
@@ -1641,6 +2725,15 @@ impl FlatCellIndex {
             tag_filter: None,
             max_assign: 1,
             spill_margin: 0.0,
+            spill_lambda: 0.0,
+            compacted: false,
+            asym_cascade: 0,
+            fastscan: false,
+            fs_codes: Vec::new(),
+            fs_off: Vec::new(),
+            prim_len: Vec::new(),
+            rep_off: Vec::new(),
+            rep_bits: Vec::new(),
             slot_cells: Vec::new(),
             i8_rerank: false,
             per_dim_sq: false,
@@ -1683,8 +2776,10 @@ impl FlatCellIndex {
             (data.to_vec(), n_all)
         };
 
+        let mut lap = crate::prof::Lap::start();
         let mut cents = crate::tree::hierarchical_kmeans(
             &train, n_train, self.dim, n_cells, seed);
+        lap.mark(crate::prof::B_TRAIN);
         for c in cents.chunks_exact_mut(self.dim) {
             let nrm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
             if nrm > 1e-12 {
@@ -1848,9 +2943,37 @@ impl FlatCellIndex {
         self.rerank_factor = rf.max(1);
     }
 
+    /// Asymmetric cascade: Hamming keeps `factor` times more survivors and the asymmetric estimator
+    /// picks the k*rerank_factor that go to the exact rerank. 0 turns it off. Query-time only.
+    fn set_asym_cascade(&mut self, factor: usize) {
+        self.asym_cascade = factor;
+    }
+
+    /// FastScan: rank the scan by the asymmetric estimate (real-valued query, 1-bit codes) using
+    /// interleaved 32-vector blocks and in-register table lookups. Takes effect at the next
+    /// compact().
+    fn set_fastscan(&mut self, on: bool) {
+        self.fastscan = on;
+        if !on {
+            self.fs_codes = Vec::new();
+            self.fs_off = Vec::new();
+        }
+    }
+
     fn set_replication(&mut self, max_assign: usize, spill_margin: f32) {
         self.max_assign = max_assign.max(1);
         self.spill_margin = spill_margin.max(0.0);
+        self.spill_lambda = 0.0;
+    }
+
+    /// Orthogonal polysemy: each vector gets `homes` cells, its nearest one plus homes - 1 whose
+    /// residuals are orthogonal to the ones already chosen (strength `lam`; 1-4 worked best). Set
+    /// it before add_batch. An extra home costs one u32 in a member list, not a copy of the vector.
+    #[pyo3(signature = (homes=2, lam=1.0))]
+    fn set_orthogonal_polysemy(&mut self, homes: usize, lam: f32) {
+        self.max_assign = homes.max(1);
+        self.spill_margin = 0.0;
+        self.spill_lambda = lam.max(1e-6);
     }
 
     /// Insert a batch.  Vectors must be L2-normalised.
@@ -1869,6 +2992,8 @@ impl FlatCellIndex {
         if arr.shape()[0] != n || arr.shape()[1] != self.dim {
             return Err(pyo3::exceptions::PyValueError::new_err("shape mismatch"));
         }
+        self.ensure_bits();
+        self.compacted = false;
 
         if self.quant_scale == 0.0 {
             let mut max_abs = 0.0f32;
@@ -1889,17 +3014,35 @@ impl FlatCellIndex {
             )
         })?;
 
+        let mut lap = crate::prof::Lap::start();
         if self.per_dim_sq && self.sq_min.is_empty() {
-            // Fit [vmin_d, vmax_d] per dimension from the first batch.  A tiny
-            // floor on the range avoids a divide-by-zero on constant dims.
-            let mut lo = vec![f32::INFINITY; self.dim];
-            let mut hi = vec![f32::NEG_INFINITY; self.dim];
-            for row in data.chunks_exact(self.dim) {
-                for (j, &x) in row.iter().enumerate() {
-                    if x < lo[j] { lo[j] = x; }
-                    if x > hi[j] { hi[j] = x; }
-                }
-            }
+            // Fit [vmin_d, vmax_d] per dimension from the first batch. A tiny floor on the range
+            // avoids dividing by zero on constant dimensions. Parallel min/max (exact, same result
+            // as the serial version).
+            let dim = self.dim;
+            let (lo, hi) = data
+                .par_chunks(dim * 4096)
+                .map(|blk| {
+                    let mut lo = vec![f32::INFINITY; dim];
+                    let mut hi = vec![f32::NEG_INFINITY; dim];
+                    for row in blk.chunks_exact(dim) {
+                        for (j, &x) in row.iter().enumerate() {
+                            if x < lo[j] { lo[j] = x; }
+                            if x > hi[j] { hi[j] = x; }
+                        }
+                    }
+                    (lo, hi)
+                })
+                .reduce(
+                    || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
+                    |(mut a, mut b), (c, e)| {
+                        for j in 0..dim {
+                            a[j] = a[j].min(c[j]);
+                            b[j] = b[j].max(e[j]);
+                        }
+                        (a, b)
+                    },
+                );
             self.sq_step = (0..self.dim)
                 .map(|j| ((hi[j] - lo[j]).max(1e-9)) / 255.0)
                 .collect();
@@ -1907,11 +3050,13 @@ impl FlatCellIndex {
         }
         // Assign in parallel (read-only over centroids), then commit serially. Placement goes
         // through the centroid tree when there is one. Scratch is per rayon task, not per vector.
+        lap.mark(crate::prof::B_SQFIT);
         let (dp, nw) = (self.dim_pad, self.n_words);
         let assignments: Vec<Vec<u32>> = data
             .par_chunks_exact(self.dim)
             .map_init(|| AssignScratch::new(dp, nw), |sc, v| self.assign_cells_routed(v, sc))
             .collect();
+        lap.mark(crate::prof::B_ASSIGN);
 
         // scratch hoisted out of the loop; it runs 10^6 times at 1M
         let mut rot = vec![0f32; self.dim_pad];
@@ -1919,7 +3064,11 @@ impl FlatCellIndex {
         let mut i8_tmp = vec![0i8; self.dim];
         let mut f16_tmp = vec![0u16; self.dim];
 
-        for (i, id) in ids.into_iter().enumerate() {
+        // Vectors that reuse freed slots go through the serial path below; the rest (all of them in
+        // a bulk build) go through append_parallel, which encodes straight into the arena in
+        // parallel.
+        let n_reuse = self.free_slots.len().min(n);
+        for (i, id) in ids.iter().copied().enumerate().take(n_reuse) {
             let v = &data[i * self.dim..(i + 1) * self.dim];
             let cell = assignments[i][0];
 
@@ -2041,10 +3190,16 @@ impl FlatCellIndex {
             self.id_to_slot.insert(id, slot);
             self.n_live += 1;
         }
+        if n_reuse < n {
+            self.append_parallel(&ids[n_reuse..], &data[n_reuse * self.dim..],
+                                 &assignments[n_reuse..]);
+        }
 
+        lap.mark(crate::prof::B_PLACE);
         for c in self.cells.iter_mut() {
             c.recompute_centroid();
         }
+        lap.mark(crate::prof::B_CENTROIDS);
         self.refresh_derived();
         Ok(())
     }
@@ -2063,6 +3218,8 @@ impl FlatCellIndex {
             Some(s) => s,
             None => return false,
         };
+        self.ensure_bits();
+        self.compacted = false;
         let primary = self.slot_cell[slot as usize] as usize;
 
         // subtract from the owning centroid only; replicas never contributed
@@ -2149,7 +3306,7 @@ impl FlatCellIndex {
     ///
     /// Returns (ids, scores), each (n_queries * k) row-major, padded with u64::MAX / -inf when a
     /// query returns fewer than k results.
-    #[pyo3(signature = (queries, k, nprobe=16, target_confidence=0.95, beta=8.0))]
+    #[pyo3(signature = (queries, k, nprobe=16, target_confidence=0.95, beta=8.0, cell_major=true))]
     fn search_batch(
         &self,
         py: Python,
@@ -2158,6 +3315,7 @@ impl FlatCellIndex {
         nprobe: usize,
         target_confidence: f32,
         beta: f32,
+        cell_major: bool,
     ) -> PyResult<(Vec<u64>, Vec<f32>)> {
         let arr = queries.as_array();
         let nq = arr.shape()[0];
@@ -2173,13 +3331,38 @@ impl FlatCellIndex {
             return Ok((vec![u64::MAX; nq * k], vec![f32::NEG_INFINITY; nq * k]));
         }
 
+        // Cell-major execution needs streamable cells (compacted, one home,
+        // no filter, binary codes) and enough queries to amortise over.
+        let cm_ok = cell_major
+            && self.scan_mode == ScanMode::Binary
+            && self.compacted
+            && (self.max_assign == 1 || !self.rep_off.is_empty())
+            && self.tag_filter.is_none()
+            && nq >= 2 * rayon::current_num_threads().max(1);
+        if cm_ok {
+            let res = py.allow_threads(|| {
+                self.search_batch_cellmajor(data, k, nprobe, target_confidence, beta)
+            });
+            let mut ids = vec![u64::MAX; nq * k];
+            let mut scs = vec![f32::NEG_INFINITY; nq * k];
+            for (qi, out) in res.iter().enumerate() {
+                for (i, &(sc, slot)) in out.iter().enumerate() {
+                    ids[qi * k + i] = self.ext_ids[slot as usize];
+                    scs[qi * k + i] = sc;
+                }
+            }
+            return Ok((ids, scs));
+        }
+
         let res: Vec<(Vec<u64>, Vec<f32>)> = py.allow_threads(|| {
             data.par_chunks_exact(self.dim)
-                .map(|q| {
-                    // One buffer per task, reused across the whole cell scan.
-                    let mut buf = SearchBuf::new(self.dim, self.dim_pad, self.n_words);
+                .map_init(
+                    // One buffer per worker, reused across queries (it used to be rebuilt for every
+                    // query).
+                    || SearchBuf::new(self.dim, self.dim_pad, self.n_words),
+                    |buf, q| {
                     let out =
-                        self.search_one(q, k, nprobe, target_confidence, beta, &mut buf);
+                        self.search_one(q, k, nprobe, target_confidence, beta, buf);
                     let mut ids = vec![u64::MAX; k];
                     let mut scs = vec![f32::NEG_INFINITY; k];
                     for (i, &(sc, slot)) in out.iter().enumerate() {
@@ -2252,6 +3435,32 @@ impl FlatCellIndex {
             + self.rr_f16.len() * 2 + self.bits.len() * 8
             + self.ext_ids.len() * 12 + self.slot_cells.len() * 4;
         m.insert("arena_bytes_per_vec".into(), bytes as f64 / n);
+
+        // Everything resident, by allocated capacity; this is the number to compare with another
+        // system's index size. The arena figure above leaves out member lists, the id map, per-cell
+        // centroid/sum vectors and the routing structures.
+        let arena_cap = self.vecs_f32.capacity() * 4 + self.scan_i8.capacity()
+            + self.rr_f16.capacity() * 2 + self.bits.capacity() * 8
+            + self.ext_ids.capacity() * 8 + self.slot_cell.capacity() * 4
+            + self.slot_cells.capacity() * 4 + self.tags.capacity() * 4
+            + self.free_slots.capacity() * 4;
+        let cells: usize = self.cells.iter()
+            .map(|c| c.members.capacity() * 4 + c.sum.capacity() * 4
+                 + c.centroid.capacity() * 4 + std::mem::size_of::<Cell>())
+            .sum();
+        let idmap = self.id_to_slot.capacity()
+            * (std::mem::size_of::<(u64, u32)>() + 1);
+        let side = self.cent_bits.capacity() * 8 + self.cent_sq8.capacity()
+            + (self.csq_min.capacity() + self.csq_step.capacity()) * 4
+            + self.cent_tree.as_ref().map(|t| t.bytes()).unwrap_or(0)
+            + self.cent_graph.as_ref().map(|g| g.bytes()).unwrap_or(0)
+            + self.rep_bits.capacity() * 8
+            + (self.prim_len.capacity() + self.rep_off.capacity()) * 4
+            + self.fs_codes.capacity() + self.fs_off.capacity() * 4;
+        let entries: usize = self.cells.iter().map(|c| c.members.len()).sum();
+        m.insert("member_entries".into(), entries as f64);
+        m.insert("rep_bytes".into(), (self.rep_bits.len() * 8) as f64);
+        m.insert("total_bytes".into(), (arena_cap + cells + idmap + side) as f64);
         m
     }
 
@@ -2292,6 +3501,8 @@ impl FlatCellIndex {
         }
         // The band is tied to the fixed cell size directly; deriving it from a cell count would
         // bring back the sqrt(N) dependency.
+        self.ensure_bits();
+        self.compacted = false;
         crate::maintain::maintain(self, TARGET_CELL_SIZE, 2.0, 0.25)
     }
 
@@ -2345,7 +3556,9 @@ impl FlatCellIndex {
     /// ingestion, and again now and then under heavy churn, since deletes and inserts slowly
     /// scatter the layout. Only moves data, never changes membership, so recall is unaffected.
     pub(crate) fn compact(&mut self) {
+        let mut lap = crate::prof::Lap::start();
         self.compact_arena();
+        lap.mark(crate::prof::B_COMPACT);
     }
 
     /// Rebalance the partition in place: split oversized cells, merge small ones. Returns (splits,
@@ -2363,6 +3576,8 @@ impl FlatCellIndex {
         } else {
             (self.n_live / live.max(1)).max(1)
         };
+        self.ensure_bits();
+        self.compacted = false;
         crate::maintain::maintain(self, t, split_ratio, merge_ratio)
     }
 
