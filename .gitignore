@@ -21,3 +21,6 @@ _archive/
 hotpot_5M.npy
 hotpot_5M.npy.partial
 bench/_scale_gt/
+
+# cached baseline indexes
+bench/_index_cache/
