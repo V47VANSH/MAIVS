@@ -301,7 +301,216 @@ def main() -> None:
             ok, err = False, f" -- {type(e).__name__}: {e}"
         check(ok, f"delete works with {mode} storage{err}")
 
+    print("\n[10] orthogonal polysemy: engaged, exact, no duplicates, deletes unlink every home")
+    import faiss
+    kmp = faiss.Kmeans(DIM, NCELLS, niter=10, spherical=True, seed=0)
+    kmp.train(base)
+    cp = np.ascontiguousarray(kmp.centroids)
+    cp /= np.linalg.norm(cp, axis=1, keepdims=True)
+
+    def build_poly(homes, mode, adaptive=False):
+        ixp = aigvs_rust.FlatCellIndex(DIM, mode, 8, 0x5EED, 0)
+        if mode == "binary":
+            ixp.set_i8_rerank(True)
+        if homes > 1:
+            ixp.set_orthogonal_polysemy(homes, 1.0)
+        if adaptive:
+            ixp.set_adaptive(True, 0.02)
+        ixp.set_centroids(cp)
+        ixp.add_batch([int(i) for i in ids], base)
+        return ixp
+
+    def rec(res):
+        return float(np.mean([len(set(a) & set(b)) / K for a, b in zip(res, truth)]))
+
+    for homes in (2, 3):
+        for mode in ("f32", "binary"):
+            ixp = build_poly(homes, mode)
+            st = ixp.stats()
+            check(st["max_assign"] == homes,
+                  f"[{mode} R={homes}] polysemy engaged (max_assign={st['max_assign']:.0f})")
+            dup_rows = 0
+            for npb in (1, 2, 4, 8, NCELLS):
+                for row in search_all(ixp, queries, npb):
+                    live = row[row >= 0]
+                    dup_rows += len(live) != len(set(live.tolist()))
+            check(dup_rows == 0, f"[{mode} R={homes}] no duplicate ids in any result row ({dup_rows} bad)")
+            if mode == "f32":
+                check(rec(search_all(ixp, queries)) > 0.999,
+                      f"[f32 R={homes}] exhaustive search equals brute force")
+                ixa = build_poly(homes, "f32", adaptive=True)
+                check(rec(search_all(ixa, queries)) > 0.999,
+                      f"[f32 R={homes}] adaptive termination still exact under polysemy")
+            victims = list(range(0, 400, 2))
+            for v in victims:
+                ixp.remove(v)
+            got = search_all(ixp, queries)
+            leaked = int(np.isin(got, victims).sum())
+            check(leaked == 0 and len(ixp) == N - len(victims),
+                  f"[{mode} R={homes}] deletes unlink every home (leaked={leaked}, len={len(ixp)})")
+
+    print("\n[11] cell-major batch search matches per-query search")
+    import time as _time
+
+    def cm_case(vecs, qs, tag, two_stage=False):
+        ixc = aigvs_rust.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
+        ixc.set_i8_rerank(True)
+        if two_stage:
+            # Engages route_batch (blocked flat Hamming + exact rescore) on the
+            # cell-major side; the per-query side uses the two-stage flat path.
+            ixc.set_two_stage(True, 2)
+            tag += "+2stage"
+        kmc = faiss.Kmeans(vecs.shape[1], NCELLS, niter=10, spherical=True, seed=0)
+        kmc.train(vecs)
+        cc = np.ascontiguousarray(kmc.centroids)
+        cc /= np.linalg.norm(cc, axis=1, keepdims=True)
+        ixc.set_centroids(cc)
+        ixc.add_batch(list(range(len(vecs))), vecs)
+        ixc.compact()                       # cell-major requires a compacted arena
+        qq = np.ascontiguousarray(np.repeat(qs, max(1, 64 // len(qs) + 1), axis=0)[:max(64, len(qs))])
+        for npb in (1, 4, NCELLS):
+            a, _ = ixc.search_batch(qq, K, npb, 1.0, 8.0, False)
+            b, _ = ixc.search_batch(qq, K, npb, 1.0, 8.0, True)
+            a = np.asarray(a).reshape(len(qq), K); b = np.asarray(b).reshape(len(qq), K)
+            ov = np.mean([len(set(x) & set(y)) / K for x, y in zip(a, b)])
+            check(ov > 0.995, f"[{tag}] cell-major == per-query at nprobe={npb} (overlap {ov:.4f})")
+        # make sure it's really the cell-major path: a delete breaks compaction and the call
+        # silently falls back, so time it
+        t0 = _time.perf_counter(); ixc.search_batch(qq, K, NCELLS, 1.0, 8.0, True); t1 = _time.perf_counter()
+        ixc.remove(0)
+        t2 = _time.perf_counter(); r, _ = ixc.search_batch(qq, K, NCELLS, 1.0, 8.0, True); t3 = _time.perf_counter()
+        check(0 not in np.asarray(r).tolist(), f"[{tag}] after a delete the fallback path is used and correct")
+
+    cm_case(base, queries, "synthetic")
+    cm_case(base, queries, "synthetic", two_stage=True)
+
+    print("\n[12] polysemic runs: streaming + cell-major match the member-list path")
+
+    def poly_case(vecs, qs, tag, homes):
+        kmp2 = faiss.Kmeans(vecs.shape[1], NCELLS, niter=10, spherical=True, seed=0)
+        kmp2.train(vecs)
+        cp2 = np.ascontiguousarray(kmp2.centroids)
+        cp2 /= np.linalg.norm(cp2, axis=1, keepdims=True)
+        def mk(compact):
+            ixp = aigvs_rust.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
+            ixp.set_i8_rerank(True)
+            ixp.set_two_stage(True, 2)
+            ixp.set_orthogonal_polysemy(homes, 1.0)
+            ixp.set_centroids(cp2)
+            ixp.add_batch(list(range(len(vecs))), vecs)
+            if compact:
+                ixp.compact()
+            return ixp
+        ref, cmp_ = mk(False), mk(True)
+        qq = np.ascontiguousarray(np.repeat(qs, max(1, 64 // len(qs) + 1), axis=0)[:max(64, len(qs))])
+        for npb in (1, 4, NCELLS):
+            a, _ = ref.search_batch(qq, K, npb, 1.0, 8.0, False)   # member-list path
+            b, _ = cmp_.search_batch(qq, K, npb, 1.0, 8.0, False)  # streaming polysemic runs
+            c, _ = cmp_.search_batch(qq, K, npb, 1.0, 8.0, True)   # cell-major polysemic runs
+            a, b, c = (np.asarray(x).reshape(len(qq), K) for x in (a, b, c))
+            ov_b = np.mean([len(set(x) & set(y)) / K for x, y in zip(a, b)])
+            ov_c = np.mean([len(set(x) & set(y)) / K for x, y in zip(a, c)])
+            dup = sum(len(set(r[r >= 0].tolist())) != len(r[r >= 0]) for r in np.vstack([b, c]))
+            check(ov_b > 0.999 and ov_c > 0.999 and dup == 0,
+                  f"[{tag} R={homes}] nprobe={npb}: stream {ov_b:.4f}, cell-major {ov_c:.4f}, dup rows {dup}")
+
+    for homes in (2, 3):
+        poly_case(base, queries, "synthetic", homes)
+
     real = os.path.join(_ROOT, "msmarco_embeddings_cache_v2_100000.npy")
+    if os.path.exists(real):
+        Xc = np.load(real)[:20200].astype(np.float32)
+        Xc /= np.linalg.norm(Xc, axis=1, keepdims=True)
+        cm_case(np.ascontiguousarray(Xc[:20000]), np.ascontiguousarray(Xc[20000:20200]), "msmarco")
+        cm_case(np.ascontiguousarray(Xc[:20000]), np.ascontiguousarray(Xc[20000:20200]), "msmarco",
+                two_stage=True)
+        for homes in (2, 3):
+            poly_case(np.ascontiguousarray(Xc[:20000]), np.ascontiguousarray(Xc[20000:20200]),
+                      "msmarco", homes)
+
+        print("\n[13] asymmetric cascade: engaged, raises recall, both paths agree")
+        rb2 = np.ascontiguousarray(Xc[:20000]); rq2 = np.ascontiguousarray(Xc[20000:20200])
+        tr2 = exact_topk(rb2, np.arange(len(rb2), dtype=np.uint64), rq2)
+        kma = faiss.Kmeans(rb2.shape[1], NCELLS, niter=10, spherical=True, seed=0)
+        kma.train(rb2)
+        ca = np.ascontiguousarray(kma.centroids); ca /= np.linalg.norm(ca, axis=1, keepdims=True)
+        ixa = aigvs_rust.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
+        ixa.set_i8_rerank(True); ixa.set_two_stage(True, 2); ixa.set_centroids(ca)
+        ixa.add_batch(list(range(len(rb2))), rb2); ixa.compact()
+        qq2 = np.ascontiguousarray(np.vstack([rq2] * 1))
+        def rr(cm):
+            ids, _ = ixa.search_batch(qq2, K, 8, 1.0, 8.0, cm)
+            ids = np.asarray(ids).reshape(len(qq2), K)
+            return ids, float(np.mean([len(set(a) & set(b)) / K for a, b in zip(ids, tr2)]))
+        _, r_off = rr(True)
+        ixa.set_asym_cascade(8)
+        ids_cm, r_on = rr(True)
+        ids_pq, r_pq = rr(False)
+        check(r_on > r_off, f"cascade raises recall at nprobe=8, rf=4 ({r_off:.4f} -> {r_on:.4f})")
+        ov = np.mean([len(set(a) & set(b)) / K for a, b in zip(ids_cm, ids_pq)])
+        check(ov > 0.999, f"cascade: cell-major == per-query (overlap {ov:.4f})")
+
+        print("\n[14] FastScan (asymmetric estimator): raises recall, paths agree, polysemy ok")
+        for homes in (1, 2):
+            def mk_fs(fs):
+                ixf = aigvs_rust.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
+                ixf.set_i8_rerank(True); ixf.set_two_stage(True, 2)
+                if homes > 1:
+                    ixf.set_orthogonal_polysemy(homes, 1.0)
+                ixf.set_fastscan(fs)
+                ixf.set_centroids(ca)
+                ixf.add_batch(list(range(len(rb2))), rb2); ixf.compact()
+                return ixf
+            ham, fsx = mk_fs(False), mk_fs(True)
+            def rr2(ix_, cm):
+                ids, _ = ix_.search_batch(qq2, K, 8, 1.0, 8.0, cm)
+                ids = np.asarray(ids).reshape(len(qq2), K)
+                return ids, float(np.mean([len(set(a) & set(b)) / K for a, b in zip(ids, tr2)]))
+            _, r_h = rr2(ham, True)
+            ids_fc, r_fc = rr2(fsx, True)
+            ids_fp, r_fp = rr2(fsx, False)
+            check(r_fc > r_h, f"[R={homes}] FastScan raises recall at nprobe=8, rf=4 ({r_h:.4f} -> {r_fc:.4f})")
+            ov = np.mean([len(set(a) & set(b)) / K for a, b in zip(ids_fc, ids_fp)])
+            dup = sum(len(set(r[r >= 0].tolist())) != len(r[r >= 0]) for r in np.vstack([ids_fc, ids_fp]))
+            check(ov > 0.999 and dup == 0,
+                  f"[R={homes}] FastScan: cell-major == per-query (overlap {ov:.4f}, dup rows {dup})")
+            # Flat codes are freed once the blocks exist (no duplicated memory)...
+            mh, mf = ham.stats()["total_bytes"], fsx.stats()["total_bytes"]
+            check(mf < mh + 16 * len(rb2),
+                  f"[R={homes}] FastScan memory {mf / len(rb2):.0f} B/vec vs Hamming {mh / len(rb2):.0f} B/vec")
+            # ...and come back exactly when needed: after a delete (mutation) and through save/load
+            victims = list(range(0, 2000, 7))
+            for v in victims:
+                ham.remove(v); fsx.remove(v)
+            a_, _ = ham.search_batch(qq2, K, 8, 1.0, 8.0, False)
+            b_, _ = fsx.search_batch(qq2, K, 8, 1.0, 8.0, False)
+            a_ = np.asarray(a_).reshape(len(qq2), K); b_ = np.asarray(b_).reshape(len(qq2), K)
+            ov2 = np.mean([len(set(x) & set(y)) / K for x, y in zip(a_, b_)])
+            check(ov2 > 0.999 and not np.isin(b_, victims).any(),
+                  f"[R={homes}] after deletes, decoded codes match the Hamming twin ({ov2:.4f})")
+            with tempfile.TemporaryDirectory() as td:
+                # (a) codes written while only the FastScan blocks were resident are exact: the
+                # reloaded FastScan index equals the reloaded Hamming twin (both rebuild routing
+                # state on load)
+                fsx.save(os.path.join(td, "fs.idx")); ham.save(os.path.join(td, "h.idx"))
+                rf_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "fs.idx"))
+                rh_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "h.idx"))
+                c_, _ = rf_.search_batch(qq2, K, 8, 1.0, 8.0, False)
+                d_, _ = rh_.search_batch(qq2, K, 8, 1.0, 8.0, False)
+                c_ = np.asarray(c_).reshape(len(qq2), K); d_ = np.asarray(d_).reshape(len(qq2), K)
+                ov3 = np.mean([len(set(x) & set(y)) / K for x, y in zip(c_, d_)])
+                check(ov3 > 0.999, f"[R={homes}] saved FastScan codes are exact (reload == Hamming twin reload, {ov3:.4f})")
+                # (b) with no mutation in between, save/load is a strict identity.
+                fresh = mk_fs(True)
+                e_, _ = fresh.search_batch(qq2, K, 8, 1.0, 8.0, False)
+                fresh.save(os.path.join(td, "fresh.idx"))
+                fr_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "fresh.idx"))
+                fr_.set_fastscan(True); fr_.compact()
+                f_, _ = fr_.search_batch(qq2, K, 8, 1.0, 8.0, False)
+                e_ = np.asarray(e_).reshape(len(qq2), K); f_ = np.asarray(f_).reshape(len(qq2), K)
+                ov4 = np.mean([len(set(x) & set(y)) / K for x, y in zip(e_, f_)])
+                check(ov4 > 0.999, f"[R={homes}] FastScan save/load/compact is an identity ({ov4:.4f})")
+
     if os.path.exists(real):
         print("\n[9] REAL embeddings (msmarco) end-to-end")
         X = np.load(real)[:20200].astype(np.float32)
@@ -319,6 +528,28 @@ def main() -> None:
         ov = np.mean([len(set(a) & set(b)) / K
                       for a, b in zip(search_all(rbin, rq), rtruth)])
         check(ov > 0.90, f"real data, binary + int8 rerank = {ov:.4f}")
+
+        # Polysemy should actually help on real data: at low nprobe a single home misses neighbours
+        # across cell boundaries and the orthogonal home recovers some. (On the synthetic fixture
+        # one home already scores 1.0, so the check would mean nothing there.)
+        import faiss
+        kmr = faiss.Kmeans(rb.shape[1], NCELLS, niter=10, spherical=True, seed=0)
+        kmr.train(rb)
+        cr = np.ascontiguousarray(kmr.centroids)
+        cr /= np.linalg.norm(cr, axis=1, keepdims=True)
+        def real_ix(homes):
+            ixr = aigvs_rust.FlatCellIndex(rb.shape[1], "f32", 8, 0x5EED, 0)
+            if homes > 1:
+                ixr.set_orthogonal_polysemy(homes, 1.0)
+            ixr.set_centroids(cr)
+            ixr.add_batch([int(i) for i in rids], rb)
+            return ixr
+        r1, r2 = real_ix(1), real_ix(2)
+        for npb in (1, 2):
+            a1 = np.mean([len(set(a) & set(b)) / K for a, b in zip(search_all(r1, rq, npb), rtruth)])
+            a2 = np.mean([len(set(a) & set(b)) / K for a, b in zip(search_all(r2, rq, npb), rtruth)])
+            check(a1 < 0.999 and a2 > a1,
+                  f"real data, orthogonal polysemy raises recall at nprobe={npb} ({a1:.4f} -> {a2:.4f})")
     else:
         print("\n[9] SKIPPED: real-embedding corpus not found")
 
