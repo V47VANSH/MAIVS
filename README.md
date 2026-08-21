@@ -13,7 +13,37 @@ It's not a graph index, and most of its properties come from that: O(1) delete (
 repair), filters that get faster the more selective they are, easy segmenting for concurrency
 (cells don't reference each other), and a query cost you can work out in bytes before running it.
 
-## Results: 1M x 384d MS MARCO, exact ground truth, 16 threads
+## Engine v3
+
+Full report: [`docs/RESULTS_V3.md`](docs/RESULTS_V3.md). What changed in the engine:
+[`docs/ENGINE_V3.md`](docs/ENGINE_V3.md). Research log:
+[`docs/RESEARCH_POLYSEMIC_ATTRACTOR_DAG.md`](docs/RESEARCH_POLYSEMIC_ATTRACTOR_DAG.md).
+
+HotpotQA 1M (d=384), exact ground truth, 16 threads, with slightly less memory than faiss-HNSW
+(1,761 vs 1,808 B/vector). Batch QPS / single-thread p50 in us:
+
+| R@10 | AIGVS, passages | faiss-HNSW | AIGVS, real questions | faiss-HNSW |
+|---|---|---|---|---|
+| 0.95 | 23,543 / 285 | 8,485 / 636 | 18,616 / 431 | 5,639 / 1,044 |
+| 0.99 | 10,300 / 937 | 3,155 / 1,734 | 7,600 / 1,337 | 1,978 / 2,923 |
+| 0.995 | 6,351 / 1,674 | 1,890 / 2,702 | 4,792 / 2,311 | 1,159 / 4,470 |
+| build | 6.0 s | 324 s | | |
+
+2.5-4.1x the throughput and lower p50/p99 at every matched recall from 0.95 to 0.995 on both query
+sets, and the same on MS MARCO 1M (2.6-4.6x). A `memory` profile at 609 B/vector (a third of
+HNSW) is 2.6-3.4x faster up to R@10 0.98.
+
+Not shown: that it gets better with scale. On held-out passages the lead narrows from ~5x at 250k
+to ~2.3-2.8x at 2M (R@10 0.98-0.99); on real questions it stays at ~4x up to 1M. I also haven't
+compared against ScaNN, DiskANN or the other graph + quantization engines yet.
+
+What changed: orthogonal polysemy (an independent second home for each vector), the FastScan
+asymmetric 1-bit estimator, cell-major batch execution, and a set of engine fixes (parallel
+ingest, integer bucket-queue top-k, O(P) bounds, prefetch).
+
+## v2 results: 1M x 384d MS MARCO, exact ground truth, 16 threads
+
+Kept for reference; the v3 numbers above replace these.
 
 | | AIGVS | faiss-hnsw | faiss-ivf |
 |---|---|---|---|
@@ -35,7 +65,7 @@ Two profiles:
 
 The quality profile beats HNSW's recall ceiling with less memory than HNSW.
 
-### Where it loses
+### Where v2 lost
 
 Throughput. 3-5x behind faiss-hnsw at matched recall at 1M, and the scaling study
 (`docs/SCALING_STUDY.md`) shows it's a trend: on HotpotQA from 10k to 5.2M, throughput at R@10 0.95
@@ -78,7 +108,9 @@ ix.remove(42)                              # ~1.4 us
 
 Set the configuration before adding data; scan mode and rerank precision are fixed at ingest.
 
-## How it works
+## How it works (v2 base)
+
+The v3 changes are in `docs/ENGINE_V3.md`; this is the design they sit on.
 
 All numbers measured on this machine against exact ground truth. Details in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the experiments behind them in
@@ -211,23 +243,26 @@ docs/            architecture, studies, plan and notes
 
 ## Open problem
 
-Routing is what stands between this and competitive throughput. At 999k with 128-vector cells the
+In v2, routing was what stood between this and competitive throughput. At 999k with 128-vector cells the
 true top-10 sit in 4.01 of 7,804 cells, but centroid ranking needs 60 probes for R@10 0.95 and 404
 for 0.99. And the floor stays flat as N grows while the probes needed don't, which is the whole
 scaling gap.
 
-I've ruled out a better per-cell summary: the best one is worth about 1.25x once it's priced
-properly (`docs/SUMMARISER_STUDY.md`). `docs/SCALABILITY_PLAN.md` is where I'm working on the rest.
+I ruled out a better per-cell summary: the best one is worth about 1.25x once it's priced
+properly (`docs/SUMMARISER_STUDY.md`). What did move it in v3 was giving each vector a second,
+orthogonal home, so the two homes miss independently; see the research log.
 
 ## Known limitations
 
-* Batch throughput at matched recall is 3-5x behind faiss-hnsw at 1M, and the gap grows with N.
+* The v3 lead over faiss-HNSW narrows with N on held-out passages; not measured past 2M.
 * "O(log N)" only holds for the router, not for the query.
 * Compaction is needed under churn but nothing schedules it.
 * `ConcurrentIndex` has no save/load, never reclaims tombstones in sealed segments, and a write
   still stalls readers while it runs.
 * `autotune()` ends up at ~1.2x the target cell size.
 * No tiered storage: 448 B/vector x 1B = 448 GB.
+* AVX2 only, built and tested on Windows only.
+* Save/load doesn't keep the polysemy and FastScan settings; set them again after loading.
 
 ## License
 
