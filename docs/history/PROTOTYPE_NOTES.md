@@ -1,4 +1,11 @@
-# Research notes: deep vs flat trees
+# Prototype notes: the recursive Hopfield tree
+
+Written in June 2026 during the first prototype (Python orchestration, a recursive
+Hopfield/attractor tree, HNSW graphs in the leaves), before the flat-cell engine. Kept because
+it states the goal the later work was measured against: O(log N) routing through a deep
+attractor tree without the duplication blow-up. The numbers are from the prototype at 100k
+vectors and its recall is the MS MARCO qrel hit rate, so they aren't comparable with the
+engine's ANN recall.
 
 What I've learned so far from the MS MARCO 100k runs about build time, memory, latency and
 recall: what worked, what didn't, and where I want to take it.

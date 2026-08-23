@@ -1,4 +1,6 @@
-# Polysemic attractor DAG: research log
+# Research log: orthogonal polysemy and the polysemic attractor DAG
+
+2026.
 
 The goal, restated: an attractor-tree index (the original AIGVS idea) that gets O(log N) query
 cost at fixed recall while keeping the partitioned index's build, memory and O(1) delete. This log
@@ -15,21 +17,25 @@ has the theory, every experiment, and where things stand. Projections are marked
 3. **A residual attractor channel** (2 bytes/vector): another 1.4-2.1x in vectors examined, but
    that gain doesn't grow with N.
 
-Orthogonal polysemy is in the engine and tested. End to end at 250k it's level on throughput, not
-a win yet, for reasons measured in section 5. O(log N) at fixed recall on the hard corpus isn't
+Orthogonal polysemy is in the engine and tested. On its own it was level on throughput at 250k,
+for reasons measured in section 5; those were then removed (contiguous replica runs, FastScan and
+cell-major execution, see the update in section 5). End-to-end results against faiss-HNSW are in
+[`RESULTS.md`](RESULTS.md). O(log N) at fixed recall on the hard corpus isn't
 reached: on HotpotQA with real questions the exponent of vectors scanned at R@10 0.99 is +0.58
 with orthogonal polysemy, from +0.76 without.
 
-## 1. Going back over the code
+## 1. Starting point, and problems found first
 
-Before starting I went back through the v2 code, the earlier docs and the old prototype. What I
-found and what I did about it:
+The starting point was the v2 `FlatCellIndex` (cells, centroid tree, 1-bit scan) and its scaling
+studies ([`history/`](history/)). The v2 conclusion was that partitioned indexes hit a geometric
+floor and that spilling doesn't help. Before testing anything new I went back over the
+measurement code:
 
-1. **"No question embeddings exist" (RESULTS.md, Part V) wasn't really true.** The 1,000 HotpotQA
-   questions exported by the June prototype's harness were still on disk, and MiniLM is cached
-   locally. They're now embedded (`bench/embed_hotpot_questions.py` ->
-   `bench/_lab_cache/hotpot_questions_minilm.npy`), and every result below is reported on these
-   real questions as well as on held-out corpus vectors.
+1. **Real questions were available.** The v2 report said there were no question embeddings, but
+   the 1,000 HotpotQA questions exported by the June prototype's harness were still around
+   (`bench/data/hotpot_questions.json`). They're now embedded
+   (`bench/data/embed_hotpot_questions.py`), and every result below is reported on these real
+   questions as well as on held-out corpus vectors.
 2. **The spill/polysemy negative tested the wrong rule.** Every spill I'd tried, and the June
    prototype's polysemy (`max - 0.08`), puts the extra copy in the next-nearest cell. Section 3
    shows why that has to fail and section 4 shows a rule that doesn't.
@@ -44,10 +50,11 @@ found and what I did about it:
    deletes unlink every home, for R=2 and R=3 in f32 and binary. Plus a real-data check that
    polysemy raises recall. All pass.
 5. **Chunked ingest costs 6x (known, still open).** `add_batch` ends in an O(N*d)
-   `refresh_derived`; 1M in 5 chunks is 74.7 s against 12.2 s in one call. Every build time here
+   `refresh_derived`; 1M in 5 chunks took 74.7 s against 12.2 s in one call
+   (v2 engine). Every build time here
    is a single `add_batch` and says so.
-6. `import sentence_transformers` segfaults on this machine (exit 139), so the embedding uses
-   `transformers` directly with MiniLM's pooling config.
+6. `import sentence_transformers` segfaults on my Windows machine, so the embedding uses
+   `transformers` directly with MiniLM's pooling (`bench/data/minilm.py`).
 
 ## 2. How things are measured here
 
@@ -205,7 +212,17 @@ the model (real questions: 0.9651 at nprobe 128 with polysemy vs 0.9573 at nprob
 but a replica entry costs ~25% more to scan than a primary. After `compact()` the primaries are
 contiguous and the replicas are scattered single-cache-line reads, and adaptive termination fires
 later. In the quality profile a fixed 1,280 x 1.5 KB f32 rerank dominates the per-query cost. Both
-are implementation costs, not limits of the idea, and both are next (section 7).
+are implementation costs, not limits of the idea.
+
+**Update.** All of that is fixed now:
+
+* Replicas have their own contiguous run in each cell (polysemic runs, [`ENGINE_V3.md`](ENGINE_V3.md)
+  section 4), so a replica costs the same to scan as a primary.
+* FastScan replaced symmetric Hamming as the first stage, which cut the rerank depth needed for a
+  given recall.
+* Cell-major execution shares each cell scan across the queries that probe it.
+
+With those, orthogonal polysemy is in both reported configurations ([`RESULTS.md`](RESULTS.md)).
 
 ## 6. The architecture
 
@@ -230,10 +247,8 @@ insert       O(log N) descent + R exact candidate scores
 
 ## 7. Next, by expected effect
 
-1. **Contiguous replicas.** Copy the 64-byte scan code of each extra home into that cell's
-   contiguous run (+64 B/vector, counted; rerank data stays single). That removes the 25% replica
-   penalty from section 5. Then re-measure at 1M against faiss-HNSW with the same threads and full
-   build time.
+1. ~~Contiguous replicas.~~ Done (polysemic runs), and re-measured at 1M against faiss-HNSW with
+   the same threads and full build time ([`RESULTS.md`](RESULTS.md)).
 2. **Residual channel in the engine** as a 2-byte pre-pass over a wider probe set, then the 64-byte
    code on the survivors.
 3. **DAG descent in the engine** instead of the shortlist tree.
@@ -241,21 +256,22 @@ insert       O(log N) descent + R exact candidate scores
 5. **The leaf exponent** (still +0.58 on real questions). Ideas with a reason to bend it: give
    extra homes (R ~ ln(1/m)/a) only to the vectors with a large residual, since the tail is a
    minority (polysemy on the worst half alone gets most of the gain); and attractors trained with a
-   ranking loss on real questions (the HotpotQA train split, 90k questions, is cached locally).
+   ranking loss on real questions (the HotpotQA train split has 90k public questions).
 
 ## 8. Reproduce
 
 ```bash
-python bench/embed_hotpot_questions.py                        # once
-KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index.py          # all checks
+python bench/data/embed_hotpot_questions.py        # once
+python tests/test_index.py                         # all checks
 # model-level studies
-python bench/research/polysemy/polysemy_lab.py msmarco_embeddings_cache_v2_1000000.npy 500000 "" <gt n499000>
-python bench/research/polysemy/polysemy_ood.py hotpot_5M.npy 250000 bench/_lab_cache/hotpot_questions_minilm.npy
-python bench/research/polysemy/multipart.py    hotpot_5M.npy 100000 bench/_lab_cache/hotpot_questions_minilm.npy
-python bench/research/polysemy/tree_lab.py hotpot hotpot_5M.npy 250000 bench/_lab_cache/hotpot_questions_minilm.npy
-python bench/research/polysemy/residual_lab.py hotpot_5M.npy 250000 bench/_lab_cache/hotpot_questions_minilm.npy
+python bench/research/polysemy/polysemy_lab.py msmarco_embeddings_cache_v2_1000000.npy 500000 "" gt.npz
+#   gt.npz: exact top-10 ids ("ids") for the script's seed-0 query/base split
+python bench/research/polysemy/polysemy_ood.py hotpot_5M.npy 250000 bench/data/hotpot_questions_minilm.npy
+python bench/research/polysemy/multipart.py    hotpot_5M.npy 100000 bench/data/hotpot_questions_minilm.npy
+python bench/research/polysemy/tree_lab.py hotpot hotpot_5M.npy 250000 bench/data/hotpot_questions_minilm.npy
+python bench/research/polysemy/residual_lab.py hotpot_5M.npy 250000 bench/data/hotpot_questions_minilm.npy
 # engine, end to end
-python bench/bench_polysemy.py hotpot_5M.npy --n 250000 --questions bench/_lab_cache/hotpot_questions_minilm.npy --arms none,near,ortho1
+python bench/bench_polysemy.py hotpot_5M.npy --n 250000 --questions bench/data/hotpot_questions_minilm.npy --arms none,near,ortho1
 ```
 
 Raw output goes to `bench/results/research/*.json` and `bench/results/polysemy_*.json`

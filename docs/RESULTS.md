@@ -1,286 +1,195 @@
-# A partitioned vector index at 5.2M: results so far
+# Results: v3 against faiss and USearch
 
-Results report. Every number comes from one machine against exact brute-force ground
-truth. Most of the results are negative, and they're the more useful half.
+All numbers come from one machine: Ryzen 7 6800H (8 cores / 16 threads), 15 GB RAM, Windows 11.
+Ground truth is exact brute force, embeddings are MiniLM-L6-v2 (d = 384). Raw output and the full
+conditions are in [`results/windows/`](../results/windows/). Every table here can be regenerated
+from those files with `python bench/results_tables.py`; the full tables are in
+[`RESULTS_tables.md`](RESULTS_tables.md).
 
-## Summary
+Query sets:
 
-I evaluate a partitioned (IVF-style) index (fixed-size cells over one flat arena, tree routing
-over the cell centroids, SIMD scan of 1-bit codes, exact rerank) against exhaustive ground truth
-on two corpora (MS MARCO and HotpotQA embeddings, d=384), from 10k to 5.23M vectors.
+* IND: 1,000 held-out corpus passages, the usual ANN benchmark setup.
+* OOD: 1,000 real HotpotQA questions embedded with the same model, which is what a retrieval system
+  actually gets asked.
 
-**What works.** A higher recall ceiling than faiss-HNSW (R@10 0.9999 vs 0.9993 at 1M; HNSW doesn't
-reach 0.9999 at any efSearch I tried), with 3.1x less memory, a 24x faster build, O(1) delete
-(~1.5-2.0 us, flat in N) and filters that make selective queries cheaper. One free throughput win
-is in (stage-2 re-order precision, 1.12-1.28x at |dR@10| <= 1e-4, with less memory), and two more
-are measured (rerank depth, cell size).
+My configurations both use orthogonal polysemy (2 homes), FastScan, polysemic runs and cell-major
+batch execution:
 
-**What doesn't.** At fixed recall, throughput falls as N^-0.78 against N^-0.21 for faiss-HNSW on
-the same data. 3.6x faster at 50k, 2.15x slower at 2M, crossing between 250k and 1M. I designed and
-measured ten fixes and all of them failed, and there's one geometric fact that explains them
-together: a query's true top-10 are further from each other (mean cos 0.460) than from the query
-(0.567). They form a shell in ~10 directions, not a cluster.
+* `quality`: exact f32 rerank, 1,761 B/vector (faiss-HNSW is 1,808).
+* `memory`: SQ8 rerank, 609 B/vector, about a third of HNSW.
 
-I also found six problems in my own measurement code, three of which had already produced
-numbers that looked final and were off by 1.4-2.6x or had the wrong sign.
+Memory for this index is every allocation by capacity (`stats()["total_bytes"]`); for faiss it's
+the serialized index size. Throughput is batch QPS (1,000 queries, all threads, best of 3).
+Latency is single-thread p50 / p99 including the Python call, for every system. Values at a target
+recall are log-interpolated between measured points, never extrapolated.
 
-## 1. Setup
+## 1. HotpotQA 1M, equal memory (`quality`) vs faiss HNSW32
 
-| | |
-|---|---|
-| corpora | MS MARCO (999k) and HotpotQA (5,233,329), d=384, L2-normalised |
-| ground truth | exact top-100 by brute force, streamed on the GPU, cached |
-| queries | 1,000 held-out vectors, the same at every scale |
-| metric | recall@10 and MRR against exhaustive search; throughput best of 7 batch runs |
-| hardware | 16-core CPU, 15.3 GB RAM, RTX 3050 (ground truth only) |
+Batch QPS / single-thread p50 in us at matched R@10.
 
-The HotpotQA corpus is shuffled on disk before slicing, so the first N rows are a uniform sample
-at every scale. The source is in document order: adjacent rows have cosine 0.0885 in source order
-and 0.0407 shuffled (random baseline 0.038). Without the shuffle, small scales would be a narrow
-set of topics and the recall-vs-N curve would measure the ordering.
-
-## Part I: what works
-
-### 1.1 Recall ceiling (1M MS MARCO)
-
-| system | max R@10 | qps there | build | memory | delete |
-|---|---|---|---|---|---|
-| this index, quality | 0.9999 | 333 | 66.8 s | 1,664 MB | 1.58 us |
-| this index, memory | 0.9939 | 337 | 74.7 s | 562 MB | 1.77 us |
-| faiss-HNSW | 0.9993 | 1,542 | 298.3 s | 1,742 MB | none |
-| faiss-IVF | 0.9935 | 221 | 9.3 s | 1,520 MB | O(N) |
-| faiss-IVF-SQ | 0.9935 | 56 | 7.9 s | 489 MB | O(N) |
-
-faiss-HNSW doesn't reach 0.9999 at any efSearch up to 512. The quality profile passes HNSW's
-ceiling at np=2048 (0.9994) and goes on to 0.9999.
-
-### 1.2 The free one: stage-2 re-order precision
-
-The router re-ordered `nprobe*mult` centroids exactly in f32, 1,536 B each: 1,536 KB per query at
-1M / np=512, a quarter of the byte budget, spent just to order cells whose order already has ~0.05
-of structured error.
-
-Probe counts are the same at f32, f16, sq8, sq6 and sq4 on both corpora, and vectors scanned
-differ by 3 in 66,555 (MS MARCO) and 4 in 200,497 (HotpotQA). It's in as `set_centroid_sq8`, on by
-default. Measured on a live index by flipping the flag on one build:
-
-| nprobe | R@10 f32 | R@10 sq8 | delta | speedup |
+| R@10 | mine, IND | HNSW, IND | mine, OOD | HNSW, OOD |
 |---|---|---|---|---|
-| 64 | 0.9301 | 0.9301 | 0 | 1.122x |
-| 256 | 0.9760 | 0.9761 | +0.0001 | 1.277x |
-| 1024 | 0.9877 | 0.9876 | -0.0001 | 1.125x |
+| 0.95 | 23,543 / 285 | 8,485 / 636 | 18,616 / 431 | 5,639 / 1,044 |
+| 0.98 | 11,890 / 783 | 4,740 / 1,168 | 11,481 / 1,066 | 3,176 / 1,928 |
+| 0.99 | 10,300 / 937 | 3,155 / 1,734 | 7,600 / 1,337 | 1,978 / 2,923 |
+| 0.995 | 6,351 / 1,674 | 1,890 / 2,702 | 4,792 / 2,311 | 1,159 / 4,470 |
 
-1.12-1.28x throughput, |dR@10| <= 1e-4, and less memory (centroids 12 MB -> 3 MB at 1M). The same
-sweep settles `shortlist_mult`: mult=1 needs 768 probes against 512 for mult=2, so the shortlist
-matters.
-
-### 1.3 Two more, measured but not the default yet
-
-**Rerank depth.** With exhaustive probing every vector is scored by its 1-bit code and only the
-top `k*rf` are rescored exactly, so a neighbour is lost when its Hamming rank is past `k*rf`.
-Being in the top 320 of 10k is easy, of 5.2M it isn't, so a fixed `rerank_factor` has to lose
-recall as N grows, and it does:
-
-| N | rf=32 (old default) | rf=128 | rf=512 |
-|---|---|---|---|
-| 100,000 | 0.9840 | 0.9946 | 0.9950 |
-| 1,000,000 | 0.9758 | 0.9902 | 0.9918 |
-
-+0.0144 recall at 1M for 4% throughput at exhaustive probing. It saturates past 256, where the
-1-bit code becomes the limit.
-
-**Cell size.** `TARGET_CELL_SIZE = 128` was the best of {128, 256, 512, 1024}; I never tried 32 or
-64. Vectors scanned at fixed recall, N=2M:
-
-| target | c=16 | c=32 | c=128 (current) |
-|---|---|---|---|
-| R@10 0.90 | 6,544 | ~9,900 | 19,295 (2.95x) |
-| R@10 0.95 | 23,197 | 31,447 | 54,613 (2.35x) |
-
-### 1.4 Things HNSW doesn't have
-
-* **O(1) delete**: 1.5-2.0 us, flat from 10k to 5.2M; recall moves -0.0046 over 100% turnover.
-  HNSW has no delete.
-* **Build**: 12.2 s at 1M (one `add_batch`), 94 s at 5.2M (~56k vectors/s), against 298 s for
-  HNSW at 1M, 24x.
-* **Filters**: pushdown makes a 1%-selective query 2x faster. Graph indexes get worse because
-  selective filters break up the graph.
-* **Predictable memory**: 464 B/vector (memory) or 1,616 B/vector (quality), linear.
-
-## Part II: what doesn't work
-
-### 2.1 Scaling
-
-Batch qps at R@10 >= 0.95, same corpus, queries and ground truth, HNSW built up to 2M (802 s,
-4.5 GB):
-
-| N | this index | faiss-HNSW | ratio |
-|---|---|---|---|
-| 10,000 | 146,720 | 157,699 | 1.07x |
-| 50,000 | 72,937 | 20,356 | 0.28x (3.6x faster) |
-| 250,000 | 23,188 | 11,914 | 0.51x |
-| 1,000,000 | 7,041 | 10,054 | 1.43x (HNSW faster) |
-| 2,000,000 | 4,225 | 9,083 | 2.15x (HNSW faster) |
-| alpha(qps), without 10k | -0.781 | -0.214 | |
-
-Extrapolated to 1B at R@10 0.95: ~33 qps against ~2,400, about 70x. "3-5x behind faiss" was a
-snapshot at 1M.
-
-alpha also depends on the recall target: +0.19 at R@10 0.90 and +0.94 at 0.98. Most queries are
-already nearly independent of N; only the tail scales.
-
-On the target itself: nothing gets O(log N) at fixed recall. HNSW's O(log N) is hop count at a
-fixed efSearch, and holding recall pushes efSearch up with N, hence -0.21 rather than 0. The real
-goal is closing -0.78 -> -0.21.
-
-### 2.2 Ten ideas that failed
-
-| # | idea | result |
+| | mine, `quality` | faiss HNSW32 (M 32, efC 200) |
 |---|---|---|
-| 1 | mean + angular radius (cone) | loses to the plain mean; no gamma beats 0 |
-| 2 | element-wise max / box bound | 8x worse; misses the target on HotpotQA |
-| 3 | low-rank residual (rank 4) | same as rank 0; residuals are close to isotropic |
-| 4 | sub-centroids / hull points | <= 1.25x once priced in their storage format |
-| 5 | spill / replication (R=4) | even in bytes; alpha +0.579 -> +0.581 |
-| 6 | L independent tables (LSH) | 3x worse at equal scan |
-| 7 | attractor / Hopfield query refinement | worse, in both the blend and neighbour-probe versions |
-| 8 | sample ladder (HNSW-like layers) | alpha +0.184 (flat) but never above R@10 0.90 |
-| 9 | cell graph, greedy walk | alpha +0.515 vs +0.426 for flat; fixed entry +0.574 |
-| 10 | precomputed query-side lists | coverage falls with N; breaks on real queries |
+| build | 6.0 s | 324 s clean (MS MARCO 999k); 412 s for this corpus, with a compile running at the same time |
+| memory | 1,761 B/vector | 1,808 B/vector |
+| best R@10 on the grid (IND / OOD) | 0.9993 / 0.9978 | 0.9982 / 0.9968 (efSearch 512) |
 
-### 2.3 The geometry behind them
+At every matched recall from 0.95 to 0.995, on both query sets:
 
-At 500k over 300 queries against exact ground truth:
+* throughput is 2.5-4.1x higher;
+* median latency is 1.5-2.4x lower, and p99 1.5-2.8x lower;
+* memory is slightly lower;
+* the build is 54x faster than the clean HNSW build, 68x faster than this run's.
 
-| | mean cosine |
-|---|---|
-| q -> its own top-10 | 0.567 |
-| top-10 -> each other | 0.460 |
-| 1st -> 10th neighbour | 0.455 |
-| random pair | 0.038 |
+On real questions the lead grows with the recall target, from 3.3x at 0.95 to 4.1x at 0.995.
 
-A query's nearest neighbours are further from each other than from the query. In 384 dimensions
-there's room for ~10 nearly orthogonal directions all at cos ~0.57 from q, so the answer set is a
-shell, not a cluster. That explains:
+**MS MARCO 999k (IND).** At R@10 0.98, 0.99 and 0.995 this index does 25,682, 23,328 and 16,929
+QPS, HNSW 9,774, 6,189 and 3,664: 2.6x, 3.8x and 4.6x, with 3.5-4.5x lower p50. Build 6.1 s vs
+324 s.
 
-* why the floor stays at 3.5-5.2 cells and doesn't shrink with N;
-* why hopping from a found neighbour fails: it moves away from the others;
-* why nearest-b expansion can't cover the answer set at any depth;
-* why replication fails: a vector's R nearest cells are all near it, so its boundary failures
-  are correlated, and more correlated chances don't thin the tail.
+## 2. Other baselines (HotpotQA, same harness)
 
-### 2.4 Why the whole family is limited
+| system | N | build | B/vector | QPS at IND R@10 0.95 | best R@10 on the grid (IND / OOD) |
+|---|---|---|---|---|---|
+| mine, `quality` | 1M | 6.0 s | 1,761 | 23,543 | 0.9993 / 0.9978 |
+| mine, `memory` | 1M | 5.5 s | 609 | 26,176 | 0.9917 / 0.9885 |
+| faiss HNSW32 | 1M | 324-412 s | 1,808 | 8,485 | 0.9982 / 0.9968 |
+| faiss IVF4096-RaBitQ + exact refine | 1M | 97 s | 1,606 | 3,201 | 0.962 / 0.940 |
+| faiss IVF4096-PQ192x4fs + exact refine | 1M | 94 s | 1,652 | 681 | 0.968 / 0.957 |
+| mine, `quality` | 250k | 4.0 s | 1,759 | 40,818 | 0.9992 / 0.9983 |
+| faiss HNSW32 | 250k | 68 s | 1,808 | 9,908 | 0.9981 / 0.9989 |
+| USearch HNSW (M 32, efC 200) | 250k | 92 s | 2,626 | 7,270 | 0.9980 / 0.9977 |
 
-Cells are chosen by ranking fixed-precision summaries globally. The number of cells that outrank
-the right one is `M * P(error > gap)`. For that to stay constant as `M = N/c` grows, summary error
-would have to shrink like 1/M, and a fixed-size summary can't do that. Every idea above is inside
-this family, and the cell-graph result shows it directly: a walk can never reach a cell that
-centroid ranking wouldn't already rank highly, since both read the same centroids.
+* USearch is a separate HNSW implementation. I only ran it at 250k, where it was slower than
+  faiss-HNSW. hnswlib has no Python 3.13 wheel for Windows, so it isn't here.
+* The two faiss IVF indexes use standard factory strings with nlist ~ 4*sqrt(N), and a grid of
+  nprobe in {16 ... 256} x k_factor in {4, 8, 16}. I didn't tune them beyond that, and their best
+  recall is limited by the grid.
 
-### 2.5 A build-time cliff
+The `memory` profile against HNSW at 1M, with a third of the memory:
 
-Graph and tree off, 1M training points:
+* IND: 3.1x the throughput at R@10 0.95 and 2.7x at 0.98.
+* OOD: 3.3x at 0.95 and 2.5x at 0.98.
+* At 0.99 IND it's a tie (3,750 vs 3,155 QPS, inside the run-to-run spread).
+* It tops out at R@10 0.992 IND / 0.989 OOD.
 
-| cells | train |
-|---|---|
-| 31,250 | 4.7 s |
-| 62,500 | 7.8 s |
-| 90,000 | > 550 s |
+## 3. Scaling
 
-A FLOP count says ~20 s at 90,000, so it's a ~25x implementation problem, not asymptotics. Likely
-cause: in `hierarchical_kmeans` the group loop ran sequentially while `kmeans_spherical` only
-parallelises within each ~3,300-point group. It blocks the cell-size win above ~62,500 cells, i.e.
-c=32 above ~2M and c=16 above ~1M. A fix is in (Part VI) but not verified yet.
+QPS ratio, mine (`quality`) / faiss HNSW32 at matched recall (HotpotQA):
 
-## Part III: problems in my own measurement code
+| | 250k | 500k | 1M | 2M* |
+|---|---|---|---|---|
+| IND R@10 0.98 | 4.85x | 4.21x | 2.51x | 2.31x |
+| IND R@10 0.99 | 4.99x | 4.60x | 3.26x | 2.78x |
+| IND R@10 0.995 | 4.05x | 4.74x | 3.36x | 4.14x |
+| OOD R@10 0.98 | 4.52x | 4.63x | 3.62x | |
+| OOD R@10 0.99 | 4.08x | 4.61x | 3.84x | |
+| OOD R@10 0.995 | 4.14x | 4.88x | 4.14x | |
+| build time ratio | 17x | 62x | 54-68x | 46x |
 
-Listed because three of them had already produced wrong numbers that looked final.
+\* There's no recent HNSW run at 2M. Those numbers come from the July run on the same machine
+with the same M and efConstruction, IND only (`results/windows/hnsw_2026-07/`). At 250k and 1M,
+where both runs exist, July's recall at each efSearch matches within 0.01 and its QPS is 0-28%
+higher, so if anything the 2M ratios are conservative. My 2M runs stream from a memory-mapped
+corpus.
 
-| problem | effect |
-|---|---|
-| `interp_at` returned the most expensive config when every grid point already cleared the target | HNSW's scaling exponents came out negative and meaningless; left alone it would have shown HNSW scaling worse than me, the opposite of the truth |
-| summaries charged 72 B while scored in f32 | sub-group win reported as 1.70x; it's 1.25x |
-| counted probes instead of vectors scanned | spill looked like "2.6x fewer probes"; in bytes it's even, because cells get 3.9x fatter |
-| probe grid capped at 8,192 | "max recall" at >= 2M measured while probing only 20% of cells |
-| benchmark never called `set_tree_route` | the routing path I use was never the one benchmarked; build fell back to the O(N*M) assignment |
-| `add_batch` runs an O(N*d) `refresh_derived` per call | chunked ingest costs `chunks * N * d`: 74.7 s in 5 chunks vs 12.2 s in one |
+Throughput decay exponent, QPS ~ N^beta:
 
-The rules I took from these: price a summary in the format it'll be stored in, and compare bytes
-moved, never probes.
-
-## Part IV: where it stands
-
-The results I'm confident in: the highest R@10 of anything tested (0.9999 vs 0.9993 for
-faiss-HNSW); 3.1x less memory; 24x faster build; O(1) delete flat to 5.2M; filters that get faster
-as they get more selective; stage-2 precision doesn't matter down to 4 bits (two corpora); cell
-size 128 isn't optimal (2.35-2.95x available); and the shell geometry of the answer set.
-
-What it isn't: the fastest. 2.15x behind HNSW at 2M and the gap is growing. Not O(log N) either:
-alpha is +0.19 to +0.94 depending on the target, and a logarithmic tree doesn't make the query
-logarithmic. And nothing here says anything about real (out-of-distribution) queries.
-
-## Part V: threats to validity
-
-1. **Only in-distribution queries.** Every query is a held-out corpus vector; real queries are
-   questions. That doesn't affect comparisons (both sides saw the same queries), but it rules out
-   trusting any design that relies on queries resembling the data. The precomputed index is the
-   pure case of that, and I built it before applying this caveat to it. Getting question
-   embeddings matters more right now than any algorithm.
-2. Two corpora, both d=384 from the same embedder family. Nothing tested at other dimensions.
-3. The alphas are power-law fits over 3-5 scales. A logarithm isn't a power law, so the thing to
-   look for is a falling local alpha, not one number.
-4. alpha from the pure-routing harness (exact in-cell scan, 100-300 queries) is consistently lower
-   than from the end-to-end harness. Compare within a table, not across documents.
-5. faiss-HNSW measured only up to 2M; the 1B projection is 500x past the last point.
-6. Run-to-run spread can reach 35% on this harness; anything inside the spread is a tie.
-
-## Part VI: status
-
-### Code changes done, verification left
-
-| # | change | state |
+| | mine | HNSW |
 |---|---|---|
-| 1 | `centroid_sq8`, SQ8 stage-2 re-order, on by default | done; 30/30 tests passed when it went in |
-| 2 | `set_rerank_factor`, rerank depth at query time | done, builds |
-| 3 | `hierarchical_kmeans` parallel over groups (`src/tree.rs`) | done, builds, not verified |
-| 4 | `quality` profile rerank 32 -> 128 | done |
-| 5 | harness fixes (`--tree`, probe grid, strided subsample, `interp_at`) | done |
+| OOD, 250k -> 1M, R@10 0.98 | -0.46 | -0.30 |
+| OOD, 250k -> 1M, R@10 0.99 | -0.42 | -0.37 |
+| OOD, 250k -> 1M, R@10 0.995 | -0.59 | -0.59 |
+| IND, 250k -> 2M, R@10 0.98 | -0.55 | -0.19 |
+| IND, 250k -> 2M, R@10 0.99 | -0.58 | -0.29 |
+| IND, 250k -> 2M, R@10 0.995 | -0.44 | -0.45 |
 
-Change 3 is the important one. The old loop carried a running `written` counter, which forced the
-sub-clusterings to run one after another, while `kmeans_spherical` only parallelises over its own
-points (~3,300 per group at k=90,000, too few for 16 cores). It's now two phases: the budget
-arithmetic sequentially, then the clusterings in parallel into separate output slices. The output
-is the same by construction (same arithmetic, same per-group seed). Peak memory goes up by
-`threads * group_size * d * 4`, about 69 MB at 1M / 125k cells.
+Reading this:
 
-`TARGET_CELL_SIZE` stays at 128 for now. The measured optimum is 32 (2.35-2.95x fewer vectors
-scanned), but that's vectors scanned, not end-to-end throughput, and c=32 quadruples the stage-1
-centroid scan (M = N/32, 4 MB/query of Hamming at 2M if routed flat). It needs an end-to-end
-throughput run first, plus the cliff fix confirmed. Changing it based on a scan-count proxy would
-be exactly the kind of mistake in Part III.
+* **Real questions.** At R@10 0.99-0.995 the lead is about 4x from 250k to 1M and both fall at
+  about the same rate. At 0.98 it narrows from 4.5x to 3.6x. I haven't run HNSW on questions past
+  1M.
+* **Held-out passages.** At 0.98-0.99 the lead narrows with N, from about 5x to 2.3-2.8x by 2M,
+  because HNSW slows down less there. At 0.995 it stays near 4x. If these exponents held, the 0.98
+  lead on held-out passages would be gone somewhere in the tens of millions.
+* So "gets better with scale" isn't shown.
+* **All of HotpotQA, 5.23M.** The `memory` profile builds in 60 s at 601 B/vector (3.1 GB) and
+  reaches IND 0.976 at 4,787 QPS and OOD 0.979 at 4,272 QPS. I didn't run HNSW: at ~1.8 KB/vector
+  the index alone would be ~9.4 GB on a 15 GB machine.
 
-### Blocked on the machine
+## 4. Where the gains came from
 
-None of the above is verified yet, and the reason is the machine, not the code. It has ~1.7 GB
-free: the test suite dies in faiss with `std::bad_alloc`, numpy can't allocate 146 MiB, and a Rust
-allocation of 2.7 MB failed. Nothing measured in that state is worth trusting.
+Ablation in the result files (HotpotQA 1M, `memory` profile without FastScan,
+`hotpot_1M_ablation_polysemy.json`):
 
-On an idle machine, in order:
+| | no polysemy | orthogonal polysemy |
+|---|---|---|
+| bytes / vector | 480 | 604 |
+| QPS at IND R@10 0.95 | 19,821 | 22,458 |
+| best IND R@10 | below 0.98 | reaches 0.98 at 9,216 QPS |
 
-1. `KMP_DUPLICATE_LIB_OK=TRUE python tests/test_index.py`, all 30 checks, before anything else.
-2. Check the cliff is gone: train on 1M points for k in {31250, 62500, 90000, 125000}. Before the
-   fix it was 4.7 s / 7.8 s / > 550 s / > 900 s; 90k and 125k should now take tens of seconds.
-3. Check change 3 didn't change the partitions: build once at 1M and compare recall with Part I.
-4. Only then look at `TARGET_CELL_SIZE`, with an end-to-end throughput run.
+Earlier development measurements (MS MARCO 1M unless noted; not part of `results/`):
 
-## Part VII: open problems
+| step | effect |
+|---|---|
+| engine fixes: parallel ingest, bucket-queue top-k, O(nprobe) bounds, SIMD rescore, prefetch, streaming cells | build 12.1 -> 4.8 s; serial latency 2.2-2.4x lower at equal recall |
+| cell-major batch execution (seeded join, shared cut-off) | batch QPS 1.5-2.5x at nprobe >= 128, identical results |
+| batch routing (blocked flat Hamming, exact shortlist) | takes the tree out of the batch path |
+| orthogonal polysemy (cost model, vectors scanned) | MS MARCO 499k: 1.6x / 2.3x / 2.7x fewer vectors at R@10 0.95 / 0.98 / 0.99; HotpotQA 500k at 0.99: 1.8x (IND), 1.9x (questions); the gain grows with N ([`RESEARCH_LOG.md`](RESEARCH_LOG.md) section 4) |
+| FastScan asymmetric first stage | much higher recall at fixed probes (0.8735 -> 0.9465 at nprobe 8, rf 4); the step that put it ahead at every recall level |
 
-1. **The k-means cliff**: 25x off its own FLOP count; it's what blocks smaller cells.
-2. **Closing -0.78 -> -0.21.** Everything I tried ranks cells globally. The one direction outside
-   that I haven't tried is a router learned from supervision (MoE-style gating trained on the
-   true top-k) instead of read off the geometry, and that needs question embeddings to be worth
-   evaluating.
-3. **A ceiling above ~0.995**: limited by the 1-bit code, not the rerank, so it needs multi-bit
-   codes.
-4. **Tiered storage**: 464 B/vector x 1B = 464 GB. Neither this nor HNSW (1.8 TB) runs 1B on one
-   machine; billion scale is a sharding problem for both.
+## 5. Scope
+
+What the data supports, on HotpotQA 250k-2M (held-out passages and real questions) and MS MARCO 1M
+(held-out passages), at equal memory against faiss-HNSW:
+
+* higher batch throughput at every matched R@10 from 0.95 to 0.995;
+* lower median and p99 single-thread latency at the same points;
+* a 17-68x faster build;
+* and with a third of the memory, higher throughput up to R@10 0.98.
+
+What it doesn't support:
+
+* Being state of the art. No comparison yet against ScaNN, DiskANN/Vamana, CAGRA or the newer
+  graph + quantization engines, on the standard ann-benchmarks sets (SIFT, GIST, GloVe, Deep), or
+  at other dimensions and metrics.
+* Getting better with scale. The lead narrows on held-out passages, and real questions past 1M
+  aren't measured.
+* Small-batch throughput. The batch numbers use 1,000-query cell-major batches. Single-query
+  latency is reported separately and beats HNSW at every matched recall, but batch sizes 1-100
+  aren't measured.
+* Linux. Everything so far is on Windows, on a laptop.
+
+## 6. Known gaps
+
+* AVX2 only, no NEON. Python binding only: no server, write-ahead log or sharding.
+* After `compact()` with FastScan, the first mutation decodes the codes back (once, in parallel),
+  and the index runs on the plain Hamming path until the next `compact()`. Nothing schedules
+  compaction.
+* Deletes leave the two-stage routing codes stale until the next refresh or reload (small effect
+  on routing).
+* `ConcurrentIndex` doesn't use cell-major execution, and save/load doesn't store the polysemy or
+  FastScan settings.
+* Laptop: run-to-run spread is up to ~10-35% under thermal load, so smaller gaps are ties.
+
+## 7. Reproduce
+
+```bash
+python bench/data/build_hotpot_corpus.py --out hotpot_5M.npy     # a GPU helps
+python bench/data/embed_hotpot_questions.py
+python tests/test_index.py
+python bench/build_hnsw_cache.py hotpot_5M.npy 1000000            # slow
+python bench/bench_vs_faiss.py hotpot_5M.npy --n 1000000 \
+    --questions bench/data/hotpot_questions_minilm.npy \
+    --systems ours-quality+poly+fs,ours-memory+poly+fs,hnsw \
+    --rfs 8,16,32 --probes 64,128,256,512,1024,2048,4096
+python bench/bench_scale_ours.py hotpot_5M.npy --n 2000000 --variant quality+poly+fs \
+    --questions bench/data/hotpot_questions_minilm.npy
+python bench/results_tables.py bench/results/*.json
+```
