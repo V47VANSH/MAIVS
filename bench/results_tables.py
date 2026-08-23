@@ -1,9 +1,14 @@
 """results_tables.py: render the head-to-head tables from saved bench_vs_faiss JSON, so no number in
 the docs is typed by hand.
 
-    python bench/results_tables.py bench/results/vs_faiss_*.json
+    python bench/results_tables.py                        # results/windows
+    python bench/results_tables.py bench/results/*.json   # fresh runs
+
+If a system appears in several files, the last file wins.
 """
+import glob
 import json
+import os
 import sys
 
 import numpy as np
@@ -27,7 +32,7 @@ def fmt(x, w=7):
 def main(paths):
     merged = {}
     for p in paths:
-        d = json.load(open(p))
+        d = json.load(open(p, encoding="utf-8"))
         key = (d["corpus"], d["n"])
         merged.setdefault(key, {}).update(d["systems"])
     for (corpus, n), systems in sorted(merged.items(), key=lambda kv: (kv[0][0], kv[0][1])):
@@ -52,4 +57,6 @@ def main(paths):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.stdout.reconfigure(encoding="utf-8")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", "windows")
+    main(sys.argv[1:] or sorted(glob.glob(os.path.join(root, "**", "*.json"), recursive=True)))

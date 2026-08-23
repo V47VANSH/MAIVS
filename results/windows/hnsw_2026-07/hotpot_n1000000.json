@@ -1,0 +1,64 @@
+{
+ "corpus": "hotpot_5M.npy",
+ "n": 1000000,
+ "systems": {
+  "hnsw-2026-07": {
+   "build_s": 371.97,
+   "mem_bytes": 3119723315.2,
+   "note": "faiss HNSW32 efC200, same machine, measured 2026-07 (bench_scale_hnsw.py); IND only; mem = process RSS",
+   "curves": {
+    "IND": [
+     {
+      "param": 16,
+      "recall": 0.8527,
+      "qps": 21471.5,
+      "p50_us": 240.4,
+      "p99_us": 460.4
+     },
+     {
+      "param": 32,
+      "recall": 0.9301,
+      "qps": 13015.5,
+      "p50_us": 403.7,
+      "p99_us": 695.0
+     },
+     {
+      "param": 64,
+      "recall": 0.9659,
+      "qps": 7688.5,
+      "p50_us": 671.8,
+      "p99_us": 1029.6000000000001
+     },
+     {
+      "param": 128,
+      "recall": 0.9862,
+      "qps": 4225.8,
+      "p50_us": 1208.1,
+      "p99_us": 1977.5
+     },
+     {
+      "param": 256,
+      "recall": 0.996,
+      "qps": 2278.1,
+      "p50_us": 2122.7,
+      "p99_us": 3286.0
+     },
+     {
+      "param": 512,
+      "recall": 0.9983,
+      "qps": 1168.8,
+      "p50_us": 4178.9,
+      "p99_us": 6484.7
+     },
+     {
+      "param": 1024,
+      "recall": 0.9991,
+      "qps": 556.2,
+      "p50_us": 8271.800000000001,
+      "p99_us": 12961.7
+     }
+    ]
+   }
+  }
+ }
+}
