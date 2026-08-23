@@ -4,13 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "aigvs"
-version = "0.1.0"
-requires-python = ">=3.8"
-dependencies = [
-    "numpy",
-    "faiss-cpu",
-    "chromadb",
-    "sentence-transformers",
-    "datasets",
-    "tqdm"
-]
+version = "0.3.0"
+description = "Partitioned vector index in Rust with Python bindings"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "Vansh Bansal", email = "v47vansh@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+bench = ["faiss-cpu", "torch", "transformers", "datasets", "usearch"]
+
+[tool.maturin]
+module-name = "aigvs"

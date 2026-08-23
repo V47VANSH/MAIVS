@@ -1,5 +1,7 @@
-# Rust
+# Rust build output
 /target
+
+# Compiled Python extension (build it locally, see README)
 *.pyd
 *.so
 *.dll
@@ -10,17 +12,14 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# corpora and caches (regenerate, don't commit)
+# corpora, embeddings and caches (regenerate, don't commit)
 *.npy
+*.npz
+*.partial
 bench/_gt_cache/
 bench/_lab_cache/
-bench/results/
-
-# old prototype material
-_archive/
-hotpot_5M.npy
-hotpot_5M.npy.partial
 bench/_scale_gt/
-
-# cached baseline indexes
 bench/_index_cache/
+bench/results/
+bench/data/hotpot_chunks/
+bench/research/polysemy/*.json

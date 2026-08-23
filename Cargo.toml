@@ -1,7 +1,12 @@
 [package]
 name = "aigvs_rust"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+authors = ["Vansh Bansal <v47vansh@gmail.com>"]
+description = "Partitioned vector index: fixed-size cells, 1-bit FastScan codes, orthogonal polysemy, cell-major batch search"
+license = "AGPL-3.0-only"
+readme = "README.md"
+publish = false
 
 [lib]
 name = "aigvs_rust"
