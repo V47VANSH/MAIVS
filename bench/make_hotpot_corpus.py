@@ -28,7 +28,7 @@ import time
 
 import numpy as np
 
-SRC = os.path.join("_archive", "legacy_python", "hotpot_bench_data")
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "hotpot_chunks")
 
 
 def main():
