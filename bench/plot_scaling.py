@@ -227,7 +227,7 @@ def main():
                labelcolor=INK2)
 
     m = data["meta"]
-    fig.text(.045, .955, "AIGVS scalability - HotpotQA", fontsize=17,
+    fig.text(.045, .955, "MAIVS scalability - HotpotQA", fontsize=17,
              fontweight="700", color=INK)
     fig.text(.045, .915,
              f"{m['n_total']:,} vectors, d={m['d']}, {m['n_queries']:,} "

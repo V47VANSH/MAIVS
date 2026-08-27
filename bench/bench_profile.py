@@ -36,13 +36,13 @@ def main():
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
-    import aigvs_rust
+    import maivs
     base, queries, gt, _, tag = load_or_build(a.corpus, k=100, n_queries=1000,
                                               limit=a.limit or None, verbose=False)
     gt10 = gt[:, :10]
     cfg = PROFILES[a.profile]
     rf = a.rf or cfg["rerank"]
-    ix = aigvs_rust.FlatCellIndex(base.shape[1], cfg["scan"], rf, 0x5EED, 0)
+    ix = maivs.FlatCellIndex(base.shape[1], cfg["scan"], rf, 0x5EED, 0)
     if cfg["per_dim_sq"]:
         ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)
@@ -51,8 +51,8 @@ def main():
     if cfg["adaptive"]:
         ix.set_adaptive(True, 0.02)
 
-    aigvs_rust.profile(True)
-    aigvs_rust.profile_read(True)
+    maivs.profile(True)
+    maivs.profile_read(True)
     t0 = time.perf_counter()
     ix.train_centroids(base, max(16, len(base) // TARGET_CELL_SIZE))
     t1 = time.perf_counter()
@@ -60,7 +60,7 @@ def main():
     t2 = time.perf_counter()
     ix.compact()
     t3 = time.perf_counter()
-    bp = dict(aigvs_rust.profile_read(True))
+    bp = dict(maivs.profile_read(True))
     build = {"train_s": t1 - t0, "ingest_s": t2 - t1, "compact_s": t3 - t2, "total_s": t3 - t0}
     print(f"N={len(base):,} profile={a.profile} rf={rf}  BUILD total {build['total_s']:.2f}s "
           f"(train {build['train_s']:.2f} + ingest {build['ingest_s']:.2f} + compact {build['compact_s']:.2f})")
@@ -70,11 +70,11 @@ def main():
            "build_phases_ms": {k: v for k, v in bp.items() if k.startswith("b.")}, "probes": {}}
     qs = np.ascontiguousarray(queries[: a.serial])
     for p in [int(x) for x in a.probes.split(",")]:
-        aigvs_rust.profile(True); aigvs_rust.profile_read(True)
+        maivs.profile(True); maivs.profile_read(True)
         for q in qs:
             ix.search(q, 10, p, 1.0, 8.0)
-        ph = dict(aigvs_rust.profile_read(True))
-        aigvs_rust.profile(False)
+        ph = dict(maivs.profile_read(True))
+        maivs.profile(False)
         n = max(ph["q.count"], 1)
         us = {k[2:]: ph[k] * 1e3 / n for k in ph if k.startswith("q.") and k != "q.count"}
         def run(cm):

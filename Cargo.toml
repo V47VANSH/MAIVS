@@ -1,5 +1,5 @@
 [package]
-name = "aigvs_rust"
+name = "maivs"
 version = "0.3.0"
 edition = "2021"
 authors = ["Vansh Bansal <v47vansh@gmail.com>"]
@@ -9,7 +9,7 @@ readme = "README.md"
 publish = false
 
 [lib]
-name = "aigvs_rust"
+name = "maivs"
 crate-type = ["cdylib"]
 
 # fat LTO + one codegen unit, otherwise the SIMD kernels don't inline across

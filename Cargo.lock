@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "aigvs_rust"
-version = "0.3.0"
-dependencies = [
- "bincode",
- "ndarray",
- "numpy",
- "parking_lot",
- "pyo3",
- "rayon",
- "serde",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -101,6 +88,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "maivs"
+version = "0.3.0"
+dependencies = [
+ "bincode",
+ "ndarray",
+ "numpy",
+ "parking_lot",
+ "pyo3",
+ "rayon",
+ "serde",
 ]
 
 [[package]]

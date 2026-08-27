@@ -56,7 +56,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=250_000)
     ap.add_argument("--serial", type=int, default=30)
     a = ap.parse_args()
-    import aigvs_rust
+    import maivs
 
     mm = np.load(a.corpus, mmap_mode="r")
     n, d = a.n, mm.shape[1]
@@ -70,7 +70,7 @@ def main():
     print(f"[gt] ready", flush=True)
 
     profile = a.variant.split("+")[0]
-    ix = aigvs_rust.FlatCellIndex(d, "binary", 32, 0x5EED, 0)
+    ix = maivs.FlatCellIndex(d, "binary", 32, 0x5EED, 0)
     if profile == "memory":
         ix.set_per_dim_sq(True)
     if "+poly" in a.variant:

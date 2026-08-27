@@ -17,7 +17,7 @@ import numpy as np
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, _ROOT)
 
-import aigvs_rust  # noqa: E402
+import maivs  # noqa: E402
 
 # Binary codes need enough bits to rank with. At d=64 a code is one 64-bit word, so Hamming has only
 # 65 possible values and can't order 4000 vectors (recall 0.467). That's the known low-dimension
@@ -101,7 +101,7 @@ def build(vecs, ids, scan_mode="binary", **kw):
     km.train(vecs)
     c = np.ascontiguousarray(km.centroids)
     c /= np.linalg.norm(c, axis=1, keepdims=True)
-    ix = aigvs_rust.FlatCellIndex(vecs.shape[1], scan_mode, 8, 0x5EED,
+    ix = maivs.FlatCellIndex(vecs.shape[1], scan_mode, 8, 0x5EED,
                                   kw.get("code_bits", 0))
     if kw.get("f16_rerank"):
         ix.set_f16_rerank(True)
@@ -183,9 +183,9 @@ def main() -> None:
 
     print("\n[2] save/load round-trip is bit-identical")
     with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "idx.aigvs")
+        p = os.path.join(td, "idx.maivs")
         ix.save(p)
-        ix2 = aigvs_rust.FlatCellIndex.load(p)
+        ix2 = maivs.FlatCellIndex.load(p)
         check(len(ix2) == len(ix), f"n_live preserved ({len(ix2)} == {len(ix)})")
         got2 = search_all(ix2, queries)
         check(np.array_equal(got, got2), "search results identical after reload")
@@ -210,9 +210,9 @@ def main() -> None:
 
     print("\n[4] deleted ids stay deleted across save/load")
     with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "idx.aigvs")
+        p = os.path.join(td, "idx.maivs")
         ixd.save(p)
-        ixl = aigvs_rust.FlatCellIndex.load(p)
+        ixl = maivs.FlatCellIndex.load(p)
         check(len(ixl) == N - 500, "n_live preserved after reload")
         got = search_all(ixl, queries)
         leaked = sum(1 for row in got for x in row if int(x) in vs)
@@ -265,7 +265,7 @@ def main() -> None:
     cg /= np.linalg.norm(cg, axis=1, keepdims=True)
 
     def build_g(graph: bool):
-        ix = aigvs_rust.FlatCellIndex(DIM, "binary", 8, 0x5EED, 0)
+        ix = maivs.FlatCellIndex(DIM, "binary", 8, 0x5EED, 0)
         ix.set_i8_rerank(True)
         ix.set_graph_route(graph, 8 if graph else 10 ** 9)
         ix.set_centroids(cg)
@@ -309,7 +309,7 @@ def main() -> None:
     cp /= np.linalg.norm(cp, axis=1, keepdims=True)
 
     def build_poly(homes, mode, adaptive=False):
-        ixp = aigvs_rust.FlatCellIndex(DIM, mode, 8, 0x5EED, 0)
+        ixp = maivs.FlatCellIndex(DIM, mode, 8, 0x5EED, 0)
         if mode == "binary":
             ixp.set_i8_rerank(True)
         if homes > 1:
@@ -353,7 +353,7 @@ def main() -> None:
     import time as _time
 
     def cm_case(vecs, qs, tag, two_stage=False):
-        ixc = aigvs_rust.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
+        ixc = maivs.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
         ixc.set_i8_rerank(True)
         if two_stage:
             # Engages route_batch (blocked flat Hamming + exact rescore) on the
@@ -392,7 +392,7 @@ def main() -> None:
         cp2 = np.ascontiguousarray(kmp2.centroids)
         cp2 /= np.linalg.norm(cp2, axis=1, keepdims=True)
         def mk(compact):
-            ixp = aigvs_rust.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
+            ixp = maivs.FlatCellIndex(vecs.shape[1], "binary", 8, 0x5EED, 0)
             ixp.set_i8_rerank(True)
             ixp.set_two_stage(True, 2)
             ixp.set_orthogonal_polysemy(homes, 1.0)
@@ -434,7 +434,7 @@ def main() -> None:
         kma = faiss.Kmeans(rb2.shape[1], NCELLS, niter=10, spherical=True, seed=0)
         kma.train(rb2)
         ca = np.ascontiguousarray(kma.centroids); ca /= np.linalg.norm(ca, axis=1, keepdims=True)
-        ixa = aigvs_rust.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
+        ixa = maivs.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
         ixa.set_i8_rerank(True); ixa.set_two_stage(True, 2); ixa.set_centroids(ca)
         ixa.add_batch(list(range(len(rb2))), rb2); ixa.compact()
         qq2 = np.ascontiguousarray(np.vstack([rq2] * 1))
@@ -453,7 +453,7 @@ def main() -> None:
         print("\n[14] FastScan (asymmetric estimator): raises recall, paths agree, polysemy ok")
         for homes in (1, 2):
             def mk_fs(fs):
-                ixf = aigvs_rust.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
+                ixf = maivs.FlatCellIndex(rb2.shape[1], "binary", 4, 0x5EED, 0)
                 ixf.set_i8_rerank(True); ixf.set_two_stage(True, 2)
                 if homes > 1:
                     ixf.set_orthogonal_polysemy(homes, 1.0)
@@ -493,8 +493,8 @@ def main() -> None:
                 # reloaded FastScan index equals the reloaded Hamming twin (both rebuild routing
                 # state on load)
                 fsx.save(os.path.join(td, "fs.idx")); ham.save(os.path.join(td, "h.idx"))
-                rf_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "fs.idx"))
-                rh_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "h.idx"))
+                rf_ = maivs.FlatCellIndex.load(os.path.join(td, "fs.idx"))
+                rh_ = maivs.FlatCellIndex.load(os.path.join(td, "h.idx"))
                 c_, _ = rf_.search_batch(qq2, K, 8, 1.0, 8.0, False)
                 d_, _ = rh_.search_batch(qq2, K, 8, 1.0, 8.0, False)
                 c_ = np.asarray(c_).reshape(len(qq2), K); d_ = np.asarray(d_).reshape(len(qq2), K)
@@ -504,7 +504,7 @@ def main() -> None:
                 fresh = mk_fs(True)
                 e_, _ = fresh.search_batch(qq2, K, 8, 1.0, 8.0, False)
                 fresh.save(os.path.join(td, "fresh.idx"))
-                fr_ = aigvs_rust.FlatCellIndex.load(os.path.join(td, "fresh.idx"))
+                fr_ = maivs.FlatCellIndex.load(os.path.join(td, "fresh.idx"))
                 fr_.set_fastscan(True); fr_.compact()
                 f_, _ = fr_.search_batch(qq2, K, 8, 1.0, 8.0, False)
                 e_ = np.asarray(e_).reshape(len(qq2), K); f_ = np.asarray(f_).reshape(len(qq2), K)
@@ -538,7 +538,7 @@ def main() -> None:
         cr = np.ascontiguousarray(kmr.centroids)
         cr /= np.linalg.norm(cr, axis=1, keepdims=True)
         def real_ix(homes):
-            ixr = aigvs_rust.FlatCellIndex(rb.shape[1], "f32", 8, 0x5EED, 0)
+            ixr = maivs.FlatCellIndex(rb.shape[1], "f32", 8, 0x5EED, 0)
             if homes > 1:
                 ixr.set_orthogonal_polysemy(homes, 1.0)
             ixr.set_centroids(cr)

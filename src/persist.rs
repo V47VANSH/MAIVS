@@ -25,7 +25,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crate::index::{Cell, FlatCellIndex, ScanMode};
 use crate::quantize as rabitq;
 
-const MAGIC: &[u8; 8] = b"AIGVS2\x00\x01";
+const MAGIC: &[u8; 8] = b"MAIVS2\x00\x01";
 
 fn io_err(e: std::io::Error) -> PyErr {
     pyo3::exceptions::PyIOError::new_err(e.to_string())
@@ -152,7 +152,7 @@ pub(crate) fn load_index(path: &str) -> PyResult<FlatCellIndex> {
     r.read_exact(&mut magic).map_err(io_err)?;
     if &magic != MAGIC {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "not an AIGVS v2 index file (bad magic or format version)",
+            "not a MAIVS v2 index file (bad magic or format version)",
         ));
     }
 

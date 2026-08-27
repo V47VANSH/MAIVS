@@ -40,7 +40,7 @@ before running it.
 | `src/persist.rs` | save / load (derived state is rebuilt, not stored) |
 | `src/maintain.rs` | online cell split / merge |
 | `src/graph.rs` | HNSW over centroids; slower than a flat scan, switched off |
-| `src/prof.rs` | opt-in phase timers (`aigvs_rust.profile`, `profile_read`) |
+| `src/prof.rs` | opt-in phase timers (`maivs.profile`, `profile_read`) |
 | `tests/test_index.py` | invariant suite, run after every change |
 | `bench/` | benchmarks and data builders ([`bench/README.md`](../bench/README.md)) |
 
@@ -189,9 +189,9 @@ RaBitQ paper also does for batch estimation.
 ## 10. Python API
 
 ```python
-import aigvs_rust
-ix = aigvs_rust.FlatCellIndex(dim, scan_mode="binary", rerank_factor=32,
-                              seed=0x5EED, code_bits=0)
+import maivs
+ix = maivs.FlatCellIndex(dim, scan_mode="binary", rerank_factor=32,
+                         seed=0x5EED, code_bits=0)
 ```
 
 | call | effect |
@@ -243,12 +243,12 @@ section 3). It isn't O(log N) at fixed recall.
 # Linux
 python -m venv .venv && . .venv/bin/activate
 pip install maturin numpy faiss-cpu
-maturin develop --release              # builds and installs aigvs_rust
+maturin develop --release              # builds and installs maivs
 python tests/test_index.py
 
 # or without maturin
 cargo build --release
-cp target/release/libaigvs_rust.so aigvs_rust.so   # Windows: aigvs_rust.dll -> aigvs_rust.pyd
+cp target/release/libmaivs.so maivs.so      # Windows: maivs.dll -> maivs.pyd
 ```
 
 `.cargo/config.toml` sets `target-cpu=native`, and `Cargo.toml` sets `lto = "fat"` and

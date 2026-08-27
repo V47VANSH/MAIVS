@@ -35,12 +35,12 @@ from common import (PROFILES, RESULTS_DIR, TARGET_CELL_SIZE, batch_ids,
 
 def build_spilled(base, profile, max_assign, spill, train_cap, ingest_chunk):
     """build_index, but with replication configured before ingestion."""
-    import aigvs_rust
+    import maivs
     import time
     cfg = PROFILES[profile]
     d = base.shape[1]
     n_cells = max(16, len(base) // TARGET_CELL_SIZE)
-    ix = aigvs_rust.FlatCellIndex(d, cfg["scan"], cfg["rerank"], 0x5EED, 0)
+    ix = maivs.FlatCellIndex(d, cfg["scan"], cfg["rerank"], 0x5EED, 0)
     if cfg["per_dim_sq"]:
         ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)

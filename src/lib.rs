@@ -30,7 +30,7 @@ mod tree;
 use pyo3::prelude::*;
 
 #[pymodule]
-fn aigvs_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn maivs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<index::FlatCellIndex>()?;
     m.add_class::<concurrent::ConcurrentIndex>()?;
     m.add_function(wrap_pyfunction!(prof::profile, m)?)?;

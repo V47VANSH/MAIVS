@@ -22,13 +22,13 @@ import faiss
 # starts
 from common import PROFILES, RESULTS_DIR, TARGET_CELL_SIZE, THREADS
 from groundtruth import normalize
-import aigvs_rust
+import maivs
 
 
 def build_with_ids(X, ids, profile):
     """Build keyed by the caller's ids, so churn can address vectors directly."""
     cfg = PROFILES[profile]
-    ix = aigvs_rust.FlatCellIndex(X.shape[1], cfg["scan"], cfg["rerank"], 0x5EED, 0)
+    ix = maivs.FlatCellIndex(X.shape[1], cfg["scan"], cfg["rerank"], 0x5EED, 0)
     if cfg["per_dim_sq"]:
         ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)

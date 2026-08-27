@@ -42,10 +42,10 @@ from common import PROFILES, RESULTS_DIR, batch_ids
 
 def build_level(vecs, ids_global, cell_size, rerank):
     """One rung: an index over `vecs`, whose ids are global row numbers."""
-    import aigvs_rust
+    import maivs
     cfg = PROFILES["memory"]
     n_cells = max(16, len(vecs) // cell_size)
-    ix = aigvs_rust.FlatCellIndex(vecs.shape[1], cfg["scan"], cfg["rerank"],
+    ix = maivs.FlatCellIndex(vecs.shape[1], cfg["scan"], cfg["rerank"],
                                   0x5EED, 0)
     ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)

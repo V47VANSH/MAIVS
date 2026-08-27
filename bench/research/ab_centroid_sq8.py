@@ -26,7 +26,7 @@ sys.path.insert(0, _ROOT)
 # extension is imported, not before it is used.
 os.environ.setdefault("RAYON_NUM_THREADS", str(os.cpu_count()))
 import groundtruth as GT  # noqa: E402
-import aigvs_rust  # noqa: E402
+import maivs  # noqa: E402
 
 
 def timed_batch(ix, Q, k, nprobe, reps=7):
@@ -73,7 +73,7 @@ def main():
     n_cells = max(1, n // args.cell_size)
     print(f"[ab] {tag}  n={n:,} d={d} cells={n_cells}")
 
-    ix = aigvs_rust.FlatCellIndex(d, "binary", args.rerank, 0x5EED, 0)
+    ix = maivs.FlatCellIndex(d, "binary", args.rerank, 0x5EED, 0)
     ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)
     ix.set_tree_route(True, 2048, 16)

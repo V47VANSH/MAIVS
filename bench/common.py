@@ -19,7 +19,7 @@ from typing import Callable, Dict, List
 
 import numpy as np
 
-# Must happen before aigvs_rust is imported anywhere.
+# Must happen before maivs is imported anywhere.
 THREADS = int(os.environ.get("BENCH_THREADS", os.cpu_count() or 8))
 os.environ.setdefault("RAYON_NUM_THREADS", str(THREADS))
 
@@ -79,13 +79,13 @@ def build_index(base: np.ndarray, profile: str = "memory", cells: int = 0,
     numbers). faiss also trains on a subsample, but it changes build time, so any run that sets it
     should say so.
     """
-    import aigvs_rust
+    import maivs
 
     cfg = PROFILES[profile]
     d = base.shape[1]
     n_cells = cells or max(16, len(base) // TARGET_CELL_SIZE)
 
-    cls = aigvs_rust.ConcurrentIndex if seal_at else aigvs_rust.FlatCellIndex
+    cls = maivs.ConcurrentIndex if seal_at else maivs.FlatCellIndex
     kwargs = {"seal_at": seal_at} if seal_at else {}
     ix = cls(d, cfg["scan"], cfg["rerank"], 0x5EED, 0, **kwargs)
 

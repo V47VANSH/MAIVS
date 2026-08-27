@@ -261,7 +261,7 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
     Running both separates the cost of quantization from the cost of partitioning.
     """
     import faiss
-    import aigvs_rust
+    import maivs
     faiss.omp_set_num_threads(_THREADS)
 
     d = base.shape[1]
@@ -275,7 +275,7 @@ def bench_v2(base, queries, gt_ids, k, rows, scan_mode: str,
     # Centroids are trained in-process with two-level hierarchical k-means (src/tree.rs). Flat
     # k-means in faiss took 54.5 s of a 67.9 s build at 1M; this takes 2.5 s, and it keeps faiss out
     # of our build time.
-    ix = aigvs_rust.FlatCellIndex(d, scan_mode, rerank_factor, 0x5EED, code_bits)
+    ix = maivs.FlatCellIndex(d, scan_mode, rerank_factor, 0x5EED, code_bits)
     if max_assign > 1:
         ix.set_replication(max_assign, spill_margin)
     if f16_rerank:

@@ -1,6 +1,6 @@
-# AIGVS
+# MAIVS
 
-A partitioned vector index in Rust with a Python binding.
+Multi-Attractor Inverted Vector Search: a partitioned vector index in Rust with a Python binding.
 
 On 1M-vector MiniLM corpora, at the same memory as faiss-HNSW, it gets 2.5-4.6x the batch
 throughput at every matched recall I measured from R@10 0.95 to 0.995, lower single-query latency
@@ -23,14 +23,14 @@ HotpotQA, 1M passages, MiniLM-L6-v2 (d = 384), exact ground truth, one 16-thread
 held-out passages, OOD = 1,000 real HotpotQA questions. Batch QPS / single-thread p50 in us at
 matched R@10.
 
-| R@10 | AIGVS, IND | faiss HNSW32, IND | AIGVS, OOD | faiss HNSW32, OOD |
+| R@10 | MAIVS, IND | faiss HNSW32, IND | MAIVS, OOD | faiss HNSW32, OOD |
 |---|---|---|---|---|
 | 0.95 | 23,543 / 285 | 8,485 / 636 | 18,616 / 431 | 5,639 / 1,044 |
 | 0.98 | 11,890 / 783 | 4,740 / 1,168 | 11,481 / 1,066 | 3,176 / 1,928 |
 | 0.99 | 10,300 / 937 | 3,155 / 1,734 | 7,600 / 1,337 | 1,978 / 2,923 |
 | 0.995 | 6,351 / 1,674 | 1,890 / 2,702 | 4,792 / 2,311 | 1,159 / 4,470 |
 
-| | AIGVS `quality` | AIGVS `memory` | faiss HNSW32 | faiss IVF-RaBitQ + refine |
+| | MAIVS `quality` | MAIVS `memory` | faiss HNSW32 | faiss IVF-RaBitQ + refine |
 |---|---|---|---|---|
 | build, 1M | 6.0 s | 5.5 s | 324 s | 97 s |
 | bytes / vector | 1,761 | 609 | 1,808 | 1,606 |
@@ -100,17 +100,17 @@ maturin develop --release
 python tests/test_index.py
 ```
 
-Without maturin: `cargo build --release`, then copy `target/release/libaigvs_rust.so` to `aigvs_rust.so`
-(on Windows, `aigvs_rust.dll` to `aigvs_rust.pyd`). `.cargo/config.toml` sets `target-cpu=native`; the kernels
+Without maturin: `cargo build --release`, then copy `target/release/libmaivs.so` to `maivs.so` (on
+Windows, `maivs.dll` to `maivs.pyd`). `.cargo/config.toml` sets `target-cpu=native`; the kernels
 need AVX2.
 
 ```python
-import numpy as np, aigvs_rust
+import numpy as np, maivs
 
 X = ...                                    # (N, 384) float32, L2-normalised
 N, d = X.shape
 
-ix = aigvs_rust.FlatCellIndex(d, "binary", 32, 0x5EED, 0)
+ix = maivs.FlatCellIndex(d, "binary", 32, 0x5EED, 0)
 ix.set_per_dim_sq(True)                    # `memory` profile; leave out for f32 rerank
 ix.set_orthogonal_polysemy(2, 1.0)
 ix.set_fastscan(True)
@@ -179,13 +179,13 @@ docs/            architecture, results, research log, references, history/
 
 ## Background
 
-AIGVS (Attractor Indexed Graphical Vector Search) started in June 2026 as a Python engine that
-routed queries through a recursive Hopfield attractor tree into graph leaves, with a small Rust
-core. The goal was O(log N) search through a deep attractor tree without the cost of copying
+MAIVS started in June 2026 as AIGVS (Attractor Indexed Graphical Vector Search): a Python engine
+that routed queries through a recursive Hopfield attractor tree into graph leaves, with a small
+Rust core. The goal was O(log N) search through a deep attractor tree without the cost of copying
 boundary vectors, and the flat-cell engine and the polysemy work here were measured against that
-goal. The design has changed completely since then (there's no graph any more); the name hasn't
-caught up. The prototype is in the early git history, and [`docs/history/`](docs/history/) keeps
-its notes and the v2 studies, negative results included.
+goal. The name changed with the design: there's no graph any more, and each vector lives in
+several attractor cells. The prototype is in the early git history, and
+[`docs/history/`](docs/history/) keeps its notes and the v2 studies, negative results included.
 
 ## License
 

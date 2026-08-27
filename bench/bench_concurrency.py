@@ -19,7 +19,7 @@ import numpy as np
 
 # import common first (sys.path, rayon thread count)
 from common import PROFILES, RESULTS_DIR, TARGET_CELL_SIZE, load_corpus
-import aigvs_rust
+import maivs
 
 
 def build(cls, base, profile, **kw):
@@ -56,8 +56,8 @@ def main():
     print("=" * 78)
     print("[1] write issued while searches are in flight")
     print("=" * 78)
-    for name, cls, kw in (("FlatCellIndex", aigvs_rust.FlatCellIndex, {}),
-                          ("ConcurrentIndex", aigvs_rust.ConcurrentIndex,
+    for name, cls, kw in (("FlatCellIndex", maivs.FlatCellIndex, {}),
+                          ("ConcurrentIndex", maivs.ConcurrentIndex,
                            {"seal_at": 10 ** 9})):
         ix = build(cls, head, a.profile, **kw)
         err, stamps = [], [[] for _ in range(a.readers)]
@@ -107,7 +107,7 @@ def main():
     print("\n" + "=" * 78)
     print("[2] concurrent read scaling (is the GIL released during search?)")
     print("=" * 78)
-    ix = build(aigvs_rust.ConcurrentIndex, head, a.profile, seal_at=10 ** 9)
+    ix = build(maivs.ConcurrentIndex, head, a.profile, seal_at=10 ** 9)
 
     def run(nt, per=150):
         def w(_i):

@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "aigvs"
+name = "maivs"
 version = "0.3.0"
 description = "Partitioned vector index in Rust with Python bindings"
 readme = "README.md"
@@ -16,4 +16,4 @@ dependencies = ["numpy"]
 bench = ["faiss-cpu", "torch", "transformers", "datasets", "usearch"]
 
 [tool.maturin]
-module-name = "aigvs"
+module-name = "maivs"

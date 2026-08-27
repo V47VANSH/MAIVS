@@ -45,10 +45,10 @@ import torch  # noqa: E402
 
 def approx_knn(X, kg, cell_size, rerank=64, chunk=200_000):
     """Approximate k-NN graph, built with this engine (one build + N queries)."""
-    import aigvs_rust
+    import maivs
     n, d = X.shape
     cfg = PROFILES["memory"]
-    ix = aigvs_rust.FlatCellIndex(d, cfg["scan"], cfg["rerank"], 0x5EED, 0)
+    ix = maivs.FlatCellIndex(d, cfg["scan"], cfg["rerank"], 0x5EED, 0)
     ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)
     ix.set_graph_route(False, 10 ** 9)

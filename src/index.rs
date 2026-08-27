@@ -1,25 +1,32 @@
-//! index: the flat-cell partitioned index (see AIGVS_MASTER_PLAN.md sec. 3 and Phase 2).
+//! index: the flat-cell partitioned index.
 //!
 //! ```text
-//!   centroids (f32, flat SIMD scan)
-//!        |  adaptive nucleus selection, capped
-//!        v
-//!   cells: Vec<u32> offsets into a single global arena
-//!        |  flat SIMD scan, no graph
-//!        v
-//!   optional f32 rerank of top (k * rerank_factor)
+//!   route   1-bit centroid codes (flat Hamming, or the centroid tree)
+//!             -> exact SQ8 rescore of a shortlist -> nucleus of cells
+//!   scan    each probed cell is one contiguous run [primaries | replicas]
+//!             of 1-bit codes (POPCNT Hamming) or FastScan blocks (4-bit LUTs)
+//!             -> integer bucket queue keeps every tie at the cut-off
+//!   rerank  exact (f32, or per-dimension SQ8) over the top k * rerank_factor
 //! ```
+//!
+//! Batches run cell-major (search_batch_cellmajor): route every query, invert the probe lists to
+//! cell -> queries, scan each cell once for all its queries, merge, rerank.
+//!
+//! Orthogonal polysemy (set_orthogonal_polysemy) gives each vector a second home whose residual is
+//! orthogonal to the first, so the two homes miss independently. Each vector is scored once per
+//! query.
 //!
 //! No graph in the leaf: at d=384 a flat int8 scan beats an NSW traversal with ef=100 up to about
 //! 10k vectors per cell, the NSW adjacency at M=64 is 544 B/node vs 384 B for the vector itself,
 //! and a graph would rule out O(1) delete.
 //!
-//! Delete: swap_remove from the owning cell's member list plus a push onto the free list. O(1),
-//! exact, no tombstones, so recall can't decay under churn.
+//! Delete: swap_remove from each home's member list plus a push onto the free list. O(homes), no
+//! tombstones, so recall doesn't decay under churn. Slot reuse slowly breaks up the cluster-major
+//! layout; compact() restores it.
 //!
 //! Scan modes: F32 scans full-precision vectors (exact within scanned cells). I8 scans a
-//! global-scale int8 copy and reranks the top k * rerank_factor in f32. Having both means the cost
-//! of quantization is measured, not assumed (that's the Phase 4 question).
+//! global-scale int8 copy and reranks the top k * rerank_factor in f32. Binary (rotated sign bits)
+//! is the one actually used; the other two are there to measure what quantization costs.
 
 use pyo3::prelude::*;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};

@@ -94,9 +94,9 @@ def pareto(curve):
 def run_ours(base, qsets, gts, variant, probes, nser, rfs, cell=TARGET_CELL_SIZE):
     """variant: memory | quality, optionally '+poly' (orthogonal polysemy, 2 homes)
     and/or '+asym' (asymmetric cascade, factor 4)."""
-    import aigvs_rust
+    import maivs
     profile = variant.split("+")[0]
-    ix = aigvs_rust.FlatCellIndex(base.shape[1], "binary", 32, 0x5EED, 0)
+    ix = maivs.FlatCellIndex(base.shape[1], "binary", 32, 0x5EED, 0)
     if profile == "memory":
         ix.set_per_dim_sq(True)
     if "+poly" in variant:

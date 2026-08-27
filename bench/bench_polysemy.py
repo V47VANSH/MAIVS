@@ -32,9 +32,9 @@ K = 10
 
 
 def build(base, arm, rf, lam, profile="memory"):
-    import aigvs_rust
+    import maivs
     cfg = PROFILES[profile]
-    ix = aigvs_rust.FlatCellIndex(base.shape[1], cfg["scan"], rf, 0x5EED, 0)
+    ix = maivs.FlatCellIndex(base.shape[1], cfg["scan"], rf, 0x5EED, 0)
     if cfg["per_dim_sq"]:
         ix.set_per_dim_sq(True)
     ix.set_two_stage(True, 2)

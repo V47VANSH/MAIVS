@@ -18,8 +18,16 @@
 //! so the quantizer only has to keep the true top-k inside the candidate pool.
 //!
 //! This is RaBitQ's rotation + sign codes with exact rerank, not its full unbiased estimator; the
-//! estimator matters when you don't rerank, and we always do. If it turns out to need an
-//! impractical rerank_factor, switch to the full estimator.
+//! estimator matters when you don't rerank, and we always do.
+//!
+//! Asymmetric estimators: symmetric Hamming throws away the query's magnitudes too. Keeping the
+//! query at 4 bits per coordinate and the data at 1 bit ranks the same cells much better (R@10
+//! after rerank 0.934 -> 0.994). Two versions:
+//! * [`AsymQuery`]: 4 query bit-planes ANDed with the codes, four POPCNTs per word; only used as an
+//!   optional second stage
+//! * [`FsQuery`]: FastScan (Andre et al.): codes interleaved by nibble in 32-vector blocks, one
+//!   16-entry u8 table per nibble position, one pshufb scores 32 vectors; the first-stage estimator
+//!   with set_fastscan(True)
 
 /// Number of (H*D) rounds. One round mixes poorly; two is enough for the sign bits to be close to
 /// uniformly informative. A third costs ~1 us more for very little.

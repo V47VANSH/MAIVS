@@ -35,10 +35,10 @@ from common import PROFILES, RESULTS_DIR, TARGET_CELL_SIZE, batch_ids
 
 
 def build_one(base, seed, profile, rerank, train_cap, ingest_chunk):
-    import aigvs_rust
+    import maivs
     cfg = PROFILES[profile]
     n_cells = max(16, len(base) // TARGET_CELL_SIZE)
-    ix = aigvs_rust.FlatCellIndex(base.shape[1], cfg["scan"], cfg["rerank"],
+    ix = maivs.FlatCellIndex(base.shape[1], cfg["scan"], cfg["rerank"],
                                   seed, 0)
     if cfg["per_dim_sq"]:
         ix.set_per_dim_sq(True)
