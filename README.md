@@ -2,9 +2,13 @@
 
 Multi-Attractor Inverted Vector Search: a partitioned vector index in Rust with a Python binding.
 
-On 1M-vector MiniLM corpora, at the same memory as faiss-HNSW, it gets 2.5-4.6x the batch
-throughput at every matched recall I measured from R@10 0.95 to 0.995, lower single-query latency
-at each of those points, and a 53-68x faster build.
+On HotpotQA passages embedded with MiniLM (d = 384), measured on Linux against AVX2 faiss, ScaNN,
+hnswlib and USearch in one harness, at 500k vectors:
+
+* about 3x the batch throughput of HNSW at matched recall (2.6-3.9x from R@10 0.95 to 0.995),
+  1.5-2.6x even without batching, with lower median latency and a build about 30x faster;
+* level with Google's ScaNN + SOAR on held-out passages and 5-20% behind it on real questions,
+  with a 4-5x faster build and ~10% less memory; ScaNN has the lower single-query latency.
 
 ```text
 fixed 128-vector cells over one flat arena
@@ -19,36 +23,34 @@ fixed 128-vector cells over one flat arena
 
 ## Results
 
-HotpotQA, 1M passages, MiniLM-L6-v2 (d = 384), exact ground truth, one 16-thread laptop CPU. IND =
-held-out passages, OOD = 1,000 real HotpotQA questions. Batch QPS / single-thread p50 in us at
-matched R@10.
+HotpotQA 500k, WSL2 Ubuntu on a 16-thread laptop (Ryzen 7 6800H), exact ground truth. IND =
+held-out passages, OOD = 1,000 real HotpotQA questions. Batch QPS (1,000 queries, 16 threads) at
+matched R@10:
 
-| R@10 | MAIVS, IND | faiss HNSW32, IND | MAIVS, OOD | faiss HNSW32, OOD |
-|---|---|---|---|---|
-| 0.95 | 23,543 / 285 | 8,485 / 636 | 18,616 / 431 | 5,639 / 1,044 |
-| 0.98 | 11,890 / 783 | 4,740 / 1,168 | 11,481 / 1,066 | 3,176 / 1,928 |
-| 0.99 | 10,300 / 937 | 3,155 / 1,734 | 7,600 / 1,337 | 1,978 / 2,923 |
-| 0.995 | 6,351 / 1,674 | 1,890 / 2,702 | 4,792 / 2,311 | 1,159 / 4,470 |
+| system | IND 0.95 | IND 0.99 | IND 0.995 | OOD 0.95 | OOD 0.99 | OOD 0.995 | build | B/vector |
+|---|---|---|---|---|---|---|---|---|
+| MAIVS `quality` | 29,738 | 12,798 | 8,548 | 25,777 | 10,206 | 7,199 | 5.2 s | 1,761 |
+| MAIVS `quality`, no batching | 16,814 | 6,513 | 3,961 | 17,134 | 4,984 | 3,191 | | |
+| ScaNN + SOAR | 31,008 | 12,349 | 9,459 | 32,397 | 10,711 | 8,949 | 20-27 s | 1,940 |
+| faiss IVF-PQ FastScan | 22,712 | 10,041 | - | 21,623 | 8,316 | - | 29-61 s | 1,665 |
+| hnswlib HNSW32 | 11,472 | 3,302 | 1,589 | 6,152 | 2,797 | 1,981 | 148 s | 1,812 |
+| faiss HNSW32 | 10,101 | 3,427 | 2,268 | 6,697 | 2,602 | 1,667 | 153 s | 1,808 |
 
-| | MAIVS `quality` | MAIVS `memory` | faiss HNSW32 | faiss IVF-RaBitQ + refine |
-|---|---|---|---|---|
-| build, 1M | 6.0 s | 5.5 s | 324 s | 97 s |
-| bytes / vector | 1,761 | 609 | 1,808 | 1,606 |
-| QPS at IND R@10 0.95 | 23,543 | 26,176 | 8,485 | 3,201 |
-| best R@10 (IND / OOD) | 0.9993 / 0.9978 | 0.992 / 0.989 | 0.9982 / 0.9968 | 0.962 / 0.940 |
-
-On MS MARCO 1M the lead is 2.6x at R@10 0.98, 3.8x at 0.99 and 4.6x at 0.995. Full tables, the
-other baselines (USearch, IVF-PQ FastScan), scaling from 250k to 5.2M and how everything was
-measured are in [`docs/RESULTS.md`](docs/RESULTS.md); the raw output is in
-[`results/windows/`](results/windows/).
+"-" = not reached in that system's grid. Latency, 250k and everything else: [`docs/RESULTS.md`](docs/RESULTS.md). Raw output:
+[`results/linux/`](results/linux/). Harness: [`bench/fair/`](bench/fair/).
 
 What these numbers don't show:
 
-* No comparison yet against ScaNN, DiskANN or CAGRA, or on the ann-benchmarks datasets.
-* Everything ran on one Windows laptop.
-* The batch numbers use 1,000-query batches.
-* The lead doesn't grow with scale. On held-out passages it narrows from ~5x at 250k to ~2.5x at
-  2M (R@10 0.98-0.99). On real questions it stays near 4x up to 1M at 0.99-0.995.
+* One corpus, one embedding model, one laptop, up to 500k on Linux. No SIFT/GIST/GloVe/Deep, no
+  other dimensions, nothing past 5.2M.
+* No comparison yet with Quake, SPFresh or DiskANN, and updates and filtered search haven't been
+  re-run against these baselines.
+* The batch numbers use cell-major execution with 1,000-query batches; at 500k batching is worth
+  about 2x.
+
+Earlier Windows runs at 1M-5.2M (`results/windows/`) used a faiss build without AVX2. The HNSW
+comparisons there hold within 10-20%; the faiss IVF numbers from those runs were wrong and aren't
+used anywhere.
 
 ## How it works
 
@@ -60,36 +62,26 @@ What these numbers don't show:
 | FastScan estimator | the query becomes a 16-entry u8 table per 4-bit group of the code; one `pshufb` scores 32 vectors | `quantize.rs` |
 | orthogonal polysemy | the second home minimises `norm(r')^2 + lam*(r'.r)^2`; the misses become independent (measured joint miss 0.018 vs 0.019 predicted) | `index.rs` |
 | polysemic runs | after `compact()` each cell is its primaries followed by its replicas, two sequential streams; every vector is scored exactly once | `index.rs` |
-| cell-major batches | route all queries, invert to cell -> queries, scan each cell once with a shared atomic cut-off; same results as per-query search | `index.rs` |
+| cell-major batches | route all queries, invert to cell -> queries, scan each cell once with a shared atomic cut-off | `index.rs` |
 | exact rerank | f32 (`quality`) or per-dimension SQ8 (`memory`) | `index.rs` |
 
-Because it isn't a graph:
-
-* delete is O(1), with no edges to repair;
-* a filter checked inside the scan gets faster the more selective it is;
-* sealed segments can be read without locks;
-* the query cost is a byte budget you can work out in advance.
+Why it's fast: a partition scan is limited by memory bandwidth, so cutting bytes (1-bit codes,
+contiguous cells, reading each cell once per batch) speeds it up almost proportionally, while a
+graph search is limited by memory latency. 1-bit codes lose recall on their own; the exact rerank,
+the independent second home and the FastScan estimator win it back. There's no graph to build and
+no codebook to train, which is where the build time goes.
 
 More in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The research behind polysemy, with the
 theory and the negative results, is in [`docs/RESEARCH_LOG.md`](docs/RESEARCH_LOG.md).
 
 ### Prior work
 
-The individual pieces are known:
-
-* the polysemy assignment loss is SOAR's (Sun, Guo & Kumar, NeurIPS 2023);
-* the 1-bit codes follow RaBitQ (Gao & Long, SIGMOD 2024);
-* the FastScan layout is from Andre et al. (VLDB 2015).
-
-What's new here is putting them together and measuring them:
-
-* a direct measurement that orthogonal homes miss independently, while next-nearest or
-  independently trained homes don't;
-* exactly-once scoring over contiguous replica runs;
-* a cell-major join that gives exactly the same results as per-query search;
-* an end-to-end comparison in one harness.
-
-See [`docs/REFERENCES.md`](docs/REFERENCES.md).
+The pieces are known: the polysemy assignment loss is SOAR's (Sun, Guo & Kumar, NeurIPS 2023),
+the 1-bit codes follow RaBitQ (Gao & Long, SIGMOD 2024), and the FastScan layout is from Andre et
+al. (VLDB 2015). What this repository adds is a direct measurement of why orthogonal homes miss independently while
+next-nearest or independently trained homes don't, exactly-once scoring over contiguous replica
+runs, a cell-major join, and an end-to-end comparison in one harness. See
+[`docs/REFERENCES.md`](docs/REFERENCES.md).
 
 ## Quick start
 
@@ -130,28 +122,28 @@ ix.remove(42)
 ```
 
 Set the configuration before adding data. Scan mode, rerank precision and polysemy are fixed at
-ingest.
+ingest. After a lot of deletes and inserts, call `compact()` again.
 
 ## Reproducing the benchmarks
 
+The Linux comparison is in [`bench/fair/`](bench/fair/README.md):
+
 ```bash
-python bench/data/build_hotpot_corpus.py --out hotpot_5M.npy   # BEIR HotpotQA, MiniLM; a GPU helps
-python bench/data/embed_hotpot_questions.py                    # the 1,000 real questions
-python bench/build_hnsw_cache.py hotpot_5M.npy 1000000
-python bench/bench_vs_faiss.py hotpot_5M.npy --n 1000000 \
-    --questions bench/data/hotpot_questions_minilm.npy \
-    --systems ours-quality+poly+fs,ours-memory+poly+fs,hnsw \
-    --rfs 8,16,32 --probes 64,128,256,512,1024,2048,4096
+bash bench/fair/setup.sh
+python bench/fair/prep_data.py
+bash bench/fair/run_all.sh
 ```
 
-See [`bench/README.md`](bench/README.md).
+The corpus builders and the earlier single-machine harness are described in
+[`bench/README.md`](bench/README.md).
 
 ## Known limitations
 
-* AVX2 kernels only, no ARM/NEON. All measurements so far are on Windows.
-* Python binding only: no server, write-ahead log or sharding.
+* AVX2 kernels only, no ARM/NEON. Python binding only: no server, write-ahead log or sharding.
 * After `compact()`, the first mutation drops back to the slower plain Hamming path until the
   next `compact()`, and nothing schedules compaction.
+* In cell-major mode with early termination on, a replica whose lowest-id home was pruned can be
+  skipped (overlap with the per-query path 0.9985-1.0000).
 * Deletes leave the two-stage routing codes stale until the next refresh.
 * `ConcurrentIndex` doesn't use cell-major execution, and save/load doesn't store the polysemy or
   FastScan settings.
@@ -171,7 +163,7 @@ src/
   maintain.rs    online split / merge
   graph.rs       HNSW over centroids (slower, off)
   prof.rs        opt-in phase timers
-bench/           head-to-head harness, data builders, research scripts
+bench/           benchmarks, data builders, research scripts; bench/fair/ for the Linux comparison
 results/         raw benchmark output
 tests/           invariant suite
 docs/            architecture, results, research log, references, history/
@@ -182,10 +174,11 @@ docs/            architecture, results, research log, references, history/
 MAIVS started in June 2026 as AIGVS (Attractor Indexed Graphical Vector Search): a Python engine
 that routed queries through a recursive Hopfield attractor tree into graph leaves, with a small
 Rust core. The goal was O(log N) search through a deep attractor tree without the cost of copying
-boundary vectors, and the flat-cell engine and the polysemy work here were measured against that
-goal. The name changed with the design: there's no graph any more, and each vector lives in
-several attractor cells. The prototype is in the early git history, and
-[`docs/history/`](docs/history/) keeps its notes and the v2 studies, negative results included.
+boundary vectors. Measuring it properly in July showed the attractor router was really IVF probe
+selection, and the flat-cell engine and the polysemy work here came out of that. The name changed
+with the design: there's no graph any more, and each vector lives in several attractor cells. The
+prototype is in the early git history, and [`docs/history/`](docs/history/) keeps its notes and
+the v2 studies, negative results included.
 
 ## License
 

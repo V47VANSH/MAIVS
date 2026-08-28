@@ -1,0 +1,15 @@
+{
+ "cpu": "AMD Ryzen 7 6800H with Radeon Graphics",
+ "threads": 16,
+ "kernel": "5.15.167.4-microsoft-standard-WSL2",
+ "python": "3.12.3",
+ "numpy": "2.5.4",
+ "faiss": "1.15.1",
+ "faiss_compile": "OPTIMIZE DD AVX2 ",
+ "scann": "1.4.2",
+ "usearch": "2.26.5",
+ "hnswlib": "0.8.0",
+ "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+ "maivs_commit": "d8147fa",
+ "os": "Windows 11 host, WSL2 Ubuntu 24.04"
+}

@@ -10,7 +10,7 @@ Raw output of `bench/bench_vs_faiss.py` and `bench/bench_scale_ours.py`. Every t
 |---|---|
 | machine | AMD Ryzen 7 6800H (8 cores / 16 threads, AVX2), 15 GB RAM, laptop on mains power |
 | OS | Windows 11 |
-| software | Python 3.13, Rust 1.96 (release, `target-cpu=native`), faiss-cpu 1.14.3, USearch 2.26.4 |
+| software | Python 3.13, Rust 1.96 (release, `target-cpu=native`), faiss-cpu 1.14.3 (the generic build, without AVX2; see below), USearch 2.26.4 |
 | data | MiniLM-L6-v2 embeddings, d = 384, L2-normalised (inner product = cosine) |
 | ground truth | exact brute force, k = 10 |
 | IND queries | the last 1,000 rows of the shuffled corpus, never indexed |
@@ -55,3 +55,9 @@ Raw output of `bench/bench_vs_faiss.py` and `bench/bench_scale_ours.py`. Every t
 * **Build times at small N are noisy.** The 250k build (4.0 s) is slower than the 500k build
   (3.1 s). Fixed costs dominate there and I haven't pinned down why.
 * **Laptop.** Run-to-run spread is up to ~10-35% under thermal load, so treat smaller gaps as ties.
+* **faiss without AVX2.** Found later: the faiss wheel on this machine loaded its generic build
+  (the AVX2 module failed to import and `get_compile_options()` was empty). HNSW is barely
+  affected, AVX2 faiss being 0-18% faster on Linux, so the HNSW ratios here are 10-20% high. The
+  two IVF files (`hotpot_1M_ivf-rabitq.json`, `hotpot_1M_ivf-pqfs.json`) are not valid
+  measurements of those indexes and aren't used in the docs. The re-run with AVX2 faiss is in
+  `results/linux/`.

@@ -1,195 +1,213 @@
-# Results: v3 against faiss and USearch
+# Results
 
-All numbers come from one machine: Ryzen 7 6800H (8 cores / 16 threads), 15 GB RAM, Windows 11.
-Ground truth is exact brute force, embeddings are MiniLM-L6-v2 (d = 384). Raw output and the full
-conditions are in [`results/windows/`](../results/windows/). Every table here can be regenerated
-from those files with `python bench/results_tables.py`; the full tables are in
-[`RESULTS_tables.md`](RESULTS_tables.md).
+Two sets of measurements:
 
-Query sets:
+1. **Linux** (sections 1-3): every system built properly (faiss with AVX2, ScaNN 1.4.2,
+   hnswlib, USearch) and run in one harness, `bench/fair/`, on HotpotQA 250k and 500k. These are
+   the main results. Raw output and conditions: [`results/linux/`](../results/linux/).
+2. **Windows** (section 4): HotpotQA 250k to 5.2M and MS MARCO 1M against faiss-HNSW,
+   in [`results/windows/`](../results/windows/). The faiss there turned out to be the generic
+   build without AVX2. That barely changes HNSW, but the faiss IVF numbers from those runs were
+   wrong and are left out here.
 
-* IND: 1,000 held-out corpus passages, the usual ANN benchmark setup.
-* OOD: 1,000 real HotpotQA questions embedded with the same model, which is what a retrieval system
-  actually gets asked.
+Both use MiniLM-L6-v2 embeddings (d = 384) and exact brute-force ground truth. IND = 1,000
+held-out passages; OOD = 1,000 real HotpotQA questions. Batch QPS is 1,000 queries on 16 threads,
+best of 3; latency is single-thread p50 including the Python call. Values at a target recall are
+log-interpolated on each system's Pareto frontier, never extrapolated; "-" means not reached.
+Differences under ~10% are within run-to-run drift.
 
-My configurations both use orthogonal polysemy (2 homes), FastScan, polysemic runs and cell-major
-batch execution:
+MAIVS configurations: `quality` (f32 rerank, 1,761 B/vector) and `memory` (SQ8 rerank,
+609 B/vector), both with orthogonal polysemy, FastScan and cell-major batches.
 
-* `quality`: exact f32 rerank, 1,761 B/vector (faiss-HNSW is 1,808).
-* `memory`: SQ8 rerank, 609 B/vector, about a third of HNSW.
+## 1. HotpotQA 500k, Linux
 
-Memory for this index is every allocation by capacity (`stats()["total_bytes"]`); for faiss it's
-the serialized index size. Throughput is batch QPS (1,000 queries, all threads, best of 3).
-Latency is single-thread p50 / p99 including the Python call, for every system. Values at a target
-recall are log-interpolated between measured points, never extrapolated.
+Batch QPS at matched R@10:
 
-## 1. HotpotQA 1M, equal memory (`quality`) vs faiss HNSW32
+| system | IND 0.95 | IND 0.98 | IND 0.99 | IND 0.995 | OOD 0.95 | OOD 0.98 | OOD 0.99 | OOD 0.995 |
+|---|---|---|---|---|---|---|---|---|
+| MAIVS `quality` | 29,738 | 18,001 | 12,798 | 8,548 | 25,777 | 15,091 | 10,206 | 7,199 |
+| MAIVS `quality`, per-query (no batching) | 16,814 | 8,936 | 6,513 | 3,961 | 17,134 | 8,417 | 4,984 | 3,191 |
+| ScaNN + SOAR | 31,008 | 19,213 | 12,349 | 9,459 | 32,397 | 18,938 | 10,711 | 8,949 |
+| ScaNN | 31,243 | 14,424 | - | - | 20,522 | 10,312 | - | - |
+| faiss IVF-PQ4fs | 22,712 | 12,876 | 10,041 | - | 21,623 | 10,734 | 8,316 | - |
+| faiss HNSW32 | 10,101 | 5,356 | 3,427 | 2,268 | 6,697 | 3,783 | 2,602 | 1,667 |
+| hnswlib HNSW32 | 11,472 | 5,579 | 3,302 | 1,589 | 6,152 | 3,943 | 2,797 | 1,981 |
+| USearch HNSW32 | 7,395 | 4,170 | 2,636 | 1,649 | 4,770 | 2,725 | 1,869 | 1,258 |
 
-Batch QPS / single-thread p50 in us at matched R@10.
+Single-thread p50 in us at matched R@10:
 
-| R@10 | mine, IND | HNSW, IND | mine, OOD | HNSW, OOD |
-|---|---|---|---|---|
-| 0.95 | 23,543 / 285 | 8,485 / 636 | 18,616 / 431 | 5,639 / 1,044 |
-| 0.98 | 11,890 / 783 | 4,740 / 1,168 | 11,481 / 1,066 | 3,176 / 1,928 |
-| 0.99 | 10,300 / 937 | 3,155 / 1,734 | 7,600 / 1,337 | 1,978 / 2,923 |
-| 0.995 | 6,351 / 1,674 | 1,890 / 2,702 | 4,792 / 2,311 | 1,159 / 4,470 |
+| system | IND 0.95 | IND 0.98 | IND 0.99 | IND 0.995 | OOD 0.95 | OOD 0.98 | OOD 0.99 | OOD 0.995 |
+|---|---|---|---|---|---|---|---|---|
+| MAIVS `quality` | 278 | 540 | 769 | 1,181 | 310 | 632 | 927 | 1,575 |
+| ScaNN + SOAR | 240 | 482 | 758 | 1,096 | 278 | 450 | 721 | 978 |
+| faiss HNSW32 | 342 | 679 | 1,061 | 1,393 | 437 | 747 | 1,083 | 1,762 |
+| hnswlib HNSW32 | 352 | 919 | 1,326 | 2,429 | 656 | 1,050 | 1,489 | 2,050 |
 
-| | mine, `quality` | faiss HNSW32 (M 32, efC 200) |
+| system | build | bytes / vector | best R@10 (IND / OOD) |
+|---|---|---|---|
+| MAIVS `quality` | 5.2 s | 1,761 | 0.9993 / 0.9970 |
+| MAIVS `memory` | 4.0 s | 609 | 0.9897 / 0.9874 |
+| ScaNN + SOAR | 19.9-27.1 s | 1,940 | 0.9981 / 0.9985 |
+| ScaNN | 13.6-19.5 s | 1,744 | 0.9882 / 0.9857 |
+| faiss IVF-PQ4fs | 28.8-60.7 s | 1,665 | 0.9908 / 0.9903 |
+| faiss HNSW32 | 152.6 s | 1,808 | 0.9988 / 0.9990 |
+| hnswlib HNSW32 | 147.5 s | 1,812 | 0.9988 / 0.9989 |
+| USearch HNSW32 | 206.4 s | 2,659 | 0.9983 / 0.9989 |
+
+(Ranges are over the two partition sizes tried for ScaNN and IVF.)
+
+What this says:
+
+* **Against HNSW** (faiss, hnswlib, USearch): 2.6-3.9x the batch throughput of the best HNSW at
+  every point, 1.5-2.6x even without batching, 1.1-1.4x lower p50, and a build about 30x faster
+  (5.2 s against 147-206 s).
+* **Against ScaNN + SOAR**: level on held-out passages (0.90-1.04x) and behind on real questions
+  (0.80-0.95x). ScaNN's p50 is equal or lower at every point. MAIVS builds 4-5x faster (5.2 s vs
+  20-27 s) with about 10% less memory.
+* faiss IVF-PQ FastScan with AVX2 is a real competitor too (about 0.75x of MAIVS here), unlike the
+  681 QPS it showed on the Windows build.
+
+## 2. HotpotQA 250k, Linux
+
+| system | IND 0.95 | IND 0.99 | IND 0.995 | OOD 0.95 | OOD 0.99 | OOD 0.995 | build |
+|---|---|---|---|---|---|---|---|
+| MAIVS `quality` | 41,603 | 19,332 | 11,686 | 33,274 | 13,385 | 9,519 | 6.2 s |
+| ScaNN + SOAR | 62,824 | 22,115 | 11,527 | 44,701 | 20,357 | 11,992 | 10.7-13.6 s |
+| faiss IVF-PQ4fs | 32,860 | 15,027 | 11,547 | 33,529 | 15,122 | 11,653 | 9.2-15.8 s |
+| faiss HNSW32 | 11,279 | 4,375 | 2,955 | 7,653 | 3,374 | 2,425 | 70.4 s |
+
+At 250k ScaNN + SOAR is further ahead (MAIVS at 0.66-1.01x of the best baseline), and the lead
+over the best HNSW is 3.3-4.2x. All the 250k tables, with latency, are in
+[`results/linux/summary_tables.md`](../results/linux/summary_tables.md).
+
+## 3. How much of it is batching
+
+Cell-major batch QPS divided by per-query QPS, MAIVS `quality`:
+
+| R@10 | 250k IND / OOD | 500k IND / OOD |
 |---|---|---|
-| build | 6.0 s | 324 s clean (MS MARCO 999k); 412 s for this corpus, with a compile running at the same time |
-| memory | 1,761 B/vector | 1,808 B/vector |
-| best R@10 on the grid (IND / OOD) | 0.9993 / 0.9978 | 0.9982 / 0.9968 (efSearch 512) |
+| 0.95 | 1.05x / 1.10x | 1.77x / 1.50x |
+| 0.98 | 1.32x / 1.13x | 2.01x / 1.79x |
+| 0.99 | 1.56x / 1.53x | 1.97x / 2.05x |
+| 0.995 | 1.67x / 1.58x | 2.16x / 2.26x |
 
-At every matched recall from 0.95 to 0.995, on both query sets:
+Against the best HNSW at 500k:
 
-* throughput is 2.5-4.1x higher;
-* median latency is 1.5-2.4x lower, and p99 1.5-2.8x lower;
-* memory is slightly lower;
-* the build is 54x faster than the clean HNSW build, 68x faster than this run's.
+| R@10 | per-query, IND / OOD | cell-major, IND / OOD | p50 (faiss HNSW / MAIVS), IND / OOD |
+|---|---|---|---|
+| 0.95 | 1.47x / 2.56x | 2.59x / 3.85x | 1.23x / 1.41x |
+| 0.98 | 1.60x / 2.13x | 3.23x / 3.83x | 1.26x / 1.18x |
+| 0.99 | 1.90x / 1.78x | 3.73x / 3.65x | 1.38x / 1.17x |
+| 0.995 | 1.75x / 1.61x | 3.77x / 3.63x | 1.18x / 1.12x |
 
-On real questions the lead grows with the recall target, from 3.3x at 0.95 to 4.1x at 0.995.
+So at 500k the lead over HNSW is roughly 2x from batching times 1.5-2.6x from the engine itself,
+and the batching share grows with N and with the recall target.
 
-**MS MARCO 999k (IND).** At R@10 0.98, 0.99 and 0.995 this index does 25,682, 23,328 and 16,929
-QPS, HNSW 9,774, 6,189 and 3,664: 2.6x, 3.8x and 4.6x, with 3.5-4.5x lower p50. Build 6.1 s vs
-324 s.
+## 4. Windows runs, 250k to 5.2M
 
-## 2. Other baselines (HotpotQA, same harness)
+These are the runs in [`results/windows/`](../results/windows/) and
+[`RESULTS_tables.md`](RESULTS_tables.md). The faiss on that machine was the generic build without
+AVX2, which I only found later. For HNSW it hardly matters (it's limited by memory latency):
 
-| system | N | build | B/vector | QPS at IND R@10 0.95 | best R@10 on the grid (IND / OOD) |
+| N | queries | R@10 | faiss HNSW, Windows -> Linux | MAIVS, Windows -> Linux | MAIVS / HNSW, Windows -> Linux |
 |---|---|---|---|---|---|
-| mine, `quality` | 1M | 6.0 s | 1,761 | 23,543 | 0.9993 / 0.9978 |
-| mine, `memory` | 1M | 5.5 s | 609 | 26,176 | 0.9917 / 0.9885 |
-| faiss HNSW32 | 1M | 324-412 s | 1,808 | 8,485 | 0.9982 / 0.9968 |
-| faiss IVF4096-RaBitQ + exact refine | 1M | 97 s | 1,606 | 3,201 | 0.962 / 0.940 |
-| faiss IVF4096-PQ192x4fs + exact refine | 1M | 94 s | 1,652 | 681 | 0.968 / 0.957 |
-| mine, `quality` | 250k | 4.0 s | 1,759 | 40,818 | 0.9992 / 0.9983 |
-| faiss HNSW32 | 250k | 68 s | 1,808 | 9,908 | 0.9981 / 0.9989 |
-| USearch HNSW (M 32, efC 200) | 250k | 92 s | 2,626 | 7,270 | 0.9980 / 0.9977 |
+| 250k | IND | 0.99 | 4,184 -> 4,375 | 20,894 -> 19,332 | 5.0x -> 4.4x |
+| 250k | OOD | 0.99 | 3,324 -> 3,374 | 13,577 -> 13,385 | 4.1x -> 4.0x |
+| 500k | IND | 0.99 | 2,898 -> 3,427 | 13,319 -> 12,798 | 4.6x -> 3.7x |
+| 500k | OOD | 0.99 | 2,279 -> 2,602 | 10,508 -> 10,206 | 4.6x -> 3.9x |
 
-* USearch is a separate HNSW implementation. I only ran it at 250k, where it was slower than
-  faiss-HNSW. hnswlib has no Python 3.13 wheel for Windows, so it isn't here.
-* The two faiss IVF indexes use standard factory strings with nlist ~ 4*sqrt(N), and a grid of
-  nprobe in {16 ... 256} x k_factor in {4, 8, 16}. I didn't tune them beyond that, and their best
-  recall is limited by the grid.
+So the HNSW ratios from Windows are 10-20% too high, and the faiss IVF-RaBitQ and IVF-PQ FastScan
+numbers from those runs (3,201 and 681 QPS at 1M) were wrong; I've dropped them.
 
-The `memory` profile against HNSW at 1M, with a third of the memory:
-
-* IND: 3.1x the throughput at R@10 0.95 and 2.7x at 0.98.
-* OOD: 3.3x at 0.95 and 2.5x at 0.98.
-* At 0.99 IND it's a tie (3,750 vs 3,155 QPS, inside the run-to-run spread).
-* It tops out at R@10 0.992 IND / 0.989 OOD.
-
-## 3. Scaling
-
-QPS ratio, mine (`quality`) / faiss HNSW32 at matched recall (HotpotQA):
+What the Windows runs add is scale. MAIVS `quality` against faiss HNSW32 at matched recall:
 
 | | 250k | 500k | 1M | 2M* |
 |---|---|---|---|---|
-| IND R@10 0.98 | 4.85x | 4.21x | 2.51x | 2.31x |
 | IND R@10 0.99 | 4.99x | 4.60x | 3.26x | 2.78x |
 | IND R@10 0.995 | 4.05x | 4.74x | 3.36x | 4.14x |
-| OOD R@10 0.98 | 4.52x | 4.63x | 3.62x | |
 | OOD R@10 0.99 | 4.08x | 4.61x | 3.84x | |
 | OOD R@10 0.995 | 4.14x | 4.88x | 4.14x | |
-| build time ratio | 17x | 62x | 54-68x | 46x |
 
-\* There's no recent HNSW run at 2M. Those numbers come from the July run on the same machine
-with the same M and efConstruction, IND only (`results/windows/hnsw_2026-07/`). At 250k and 1M,
-where both runs exist, July's recall at each efSearch matches within 0.01 and its QPS is 0-28%
-higher, so if anything the 2M ratios are conservative. My 2M runs stream from a memory-mapped
-corpus.
+\* July HNSW run, same machine and parameters, IND only.
 
-Throughput decay exponent, QPS ~ N^beta:
+Expect these to be 10-20% lower with AVX2 faiss. On held-out passages the lead narrows with N; on
+real questions it stays roughly flat up to 1M. MS MARCO 1M looked the same (2.6-4.6x at 0.98-0.995
+on Windows). At 5.23M the `memory` profile builds in 60 s at 601 B/vector and reaches IND 0.976 at
+4,787 QPS; HNSW wouldn't fit on the machine.
 
-| | mine | HNSW |
+## 5. Where the gains came from
+
+From the development runs, HotpotQA 1M, same harness throughout (Windows; each row
+already has the engine fixes and cell-major batching):
+
+| variant | B/vector | IND 0.95 | IND 0.98 | IND 0.99 | OOD 0.95 | OOD 0.98 | best IND / OOD |
+|---|---|---|---|---|---|---|---|
+| `memory`, no polysemy, no FastScan | 480 | 19,821 | - | - | - | - | 0.9728 / 0.9480 |
+| `quality`, no polysemy, no FastScan | 1,632 | 6,872 | 5,166 | 3,739 | 6,176 | 3,907 | 0.9921 / 0.9886 |
+| `memory` + polysemy | 604 | 22,458 | 9,216 | - | 13,809 | 4,040 | 0.9894 / 0.9835 |
+| `memory` + polysemy + FastScan | 609 | 26,176 | 12,572 | 3,750 | 18,888 | 8,000 | 0.9917 / 0.9885 |
+| `quality` + polysemy + FastScan | 1,761 | 26,339 | 13,950 | 10,361 | 17,684 | 11,486 | 0.9993 / 0.9978 |
+| faiss HNSW32 (generic build) | 1,808 | 8,756 | 4,929 | 3,228 | 5,496 | 3,101 | 0.9982 / 0.9968 |
+
+Without polysemy and FastScan, `quality` was behind HNSW at 1M (6,872 vs 8,756), which is what the
+earlier report found. Together they're worth 3.4-3.8x at IND 0.95 and ~2.9x on real questions, and
+that's what turned it around. Earlier in the chain:
+
+| change | effect | when |
 |---|---|---|
-| OOD, 250k -> 1M, R@10 0.98 | -0.46 | -0.30 |
-| OOD, 250k -> 1M, R@10 0.99 | -0.42 | -0.37 |
-| OOD, 250k -> 1M, R@10 0.995 | -0.59 | -0.59 |
-| IND, 250k -> 2M, R@10 0.98 | -0.55 | -0.19 |
-| IND, 250k -> 2M, R@10 0.99 | -0.58 | -0.29 |
-| IND, 250k -> 2M, R@10 0.995 | -0.44 | -0.45 |
+| flat cells, correct quantizer scale, exact rerank (v1 -> v2) | R@10 0.9648 -> 0.9952, QPS 78 -> 390 | July, 100k |
+| 1-bit rotated codes instead of int8 | 4.3x at R@10 0.966 | July, 100k |
+| cluster-major arena (`compact()`) | 3.0x, same recall | July, 1M |
+| SQ8 centroid re-order | 1.12-1.28x | July, 1M |
+| engine fixes (parallel encode, bucket-queue top-k, O(nprobe) bounds, prefetch) | 1.23-1.50x per query; build 12.1 -> 4.8 s | 1M |
+| cell-major batches | 1.26x at nprobe 64 up to 2.40x at 1024 | 1M |
 
-Reading this:
+These come from different corpora, sizes and engine versions, so they shouldn't be multiplied
+together. What I don't have yet is a leave-one-out ablation of the final configuration on the
+Linux harness.
 
-* **Real questions.** At R@10 0.99-0.995 the lead is about 4x from 250k to 1M and both fall at
-  about the same rate. At 0.98 it narrows from 4.5x to 3.6x. I haven't run HNSW on questions past
-  1M.
-* **Held-out passages.** At 0.98-0.99 the lead narrows with N, from about 5x to 2.3-2.8x by 2M,
-  because HNSW slows down less there. At 0.995 it stays near 4x. If these exponents held, the 0.98
-  lead on held-out passages would be gone somewhere in the tens of millions.
-* So "gets better with scale" isn't shown.
-* **All of HotpotQA, 5.23M.** The `memory` profile builds in 60 s at 601 B/vector (3.1 GB) and
-  reaches IND 0.976 at 4,787 QPS and OOD 0.979 at 4,272 QPS. I didn't run HNSW: at ~1.8 KB/vector
-  the index alone would be ~9.4 GB on a 15 GB machine.
+The short version of the mechanism: a partition scan is bound by memory bandwidth, so fewer bytes
+(1-bit codes, contiguous cells, reading each cell once per batch) means proportionally more speed;
+a graph search is bound by memory latency, where compression just adds decode work to each hop.
+1-bit codes lose recall on their own, and the exact rerank, the independent second home and the
+FastScan estimator win it back.
 
-## 4. Where the gains came from
+## 6. Scope
 
-Ablation in the result files (HotpotQA 1M, `memory` profile without FastScan,
-`hotpot_1M_ablation_polysemy.json`):
+What the data supports, for 384-d MiniLM embeddings of text passages on one machine:
 
-| | no polysemy | orthogonal polysemy |
-|---|---|---|
-| bytes / vector | 480 | 604 |
-| QPS at IND R@10 0.95 | 19,821 | 22,458 |
-| best IND R@10 | below 0.98 | reaches 0.98 at 9,216 QPS |
-
-Earlier development measurements (MS MARCO 1M unless noted; not part of `results/`):
-
-| step | effect |
-|---|---|
-| engine fixes: parallel ingest, bucket-queue top-k, O(nprobe) bounds, SIMD rescore, prefetch, streaming cells | build 12.1 -> 4.8 s; serial latency 2.2-2.4x lower at equal recall |
-| cell-major batch execution (seeded join, shared cut-off) | batch QPS 1.5-2.5x at nprobe >= 128, identical results |
-| batch routing (blocked flat Hamming, exact shortlist) | takes the tree out of the batch path |
-| orthogonal polysemy (cost model, vectors scanned) | MS MARCO 499k: 1.6x / 2.3x / 2.7x fewer vectors at R@10 0.95 / 0.98 / 0.99; HotpotQA 500k at 0.99: 1.8x (IND), 1.9x (questions); the gain grows with N ([`RESEARCH_LOG.md`](RESEARCH_LOG.md) section 4) |
-| FastScan asymmetric first stage | much higher recall at fixed probes (0.8735 -> 0.9465 at nprobe 8, rf 4); the step that put it ahead at every recall level |
-
-## 5. Scope
-
-What the data supports, on HotpotQA 250k-2M (held-out passages and real questions) and MS MARCO 1M
-(held-out passages), at equal memory against faiss-HNSW:
-
-* higher batch throughput at every matched R@10 from 0.95 to 0.995;
-* lower median and p99 single-thread latency at the same points;
-* a 17-68x faster build;
-* and with a third of the memory, higher throughput up to R@10 0.98.
+* about 3x the batch throughput of HNSW (2.6-3.9x at 500k), 1.5-2.6x without batching, and lower
+  median latency at every matched recall from 0.95 to 0.995;
+* level with ScaNN + SOAR on held-out passages and 5-20% behind on real questions, with a 4-5x
+  faster build and ~10% less memory; ScaNN has the lower single-query latency;
 
 What it doesn't support:
 
-* Being state of the art. No comparison yet against ScaNN, DiskANN/Vamana, CAGRA or the newer
-  graph + quantization engines, on the standard ann-benchmarks sets (SIFT, GIST, GloVe, Deep), or
-  at other dimensions and metrics.
-* Getting better with scale. The lead narrows on held-out passages, and real questions past 1M
-  aren't measured.
-* Small-batch throughput. The batch numbers use 1,000-query cell-major batches. Single-query
-  latency is reported separately and beats HNSW at every matched recall, but batch sizes 1-100
-  aren't measured.
-* Linux. Everything so far is on Windows, on a laptop.
+* anything about other datasets (SIFT, GIST, GloVe, Deep), dimensions or embedding models;
+* anything above 500k on Linux, or above 5.2M at all;
+* anything about updates or filtered search against these baselines (not run yet);
+* a comparison with Quake, SPFresh or DiskANN.
 
-## 6. Known gaps
+## 7. Known gaps
 
-* AVX2 only, no NEON. Python binding only: no server, write-ahead log or sharding.
-* After `compact()` with FastScan, the first mutation decodes the codes back (once, in parallel),
-  and the index runs on the plain Hamming path until the next `compact()`. Nothing schedules
-  compaction.
-* Deletes leave the two-stage routing codes stale until the next refresh or reload (small effect
-  on routing).
-* `ConcurrentIndex` doesn't use cell-major execution, and save/load doesn't store the polysemy or
-  FastScan settings.
-* Laptop: run-to-run spread is up to ~10-35% under thermal load, so smaller gaps are ties.
+* `compact()` isn't scheduled automatically.
+* In cell-major mode the exactly-once bitset is built before adaptive pruning, so with early
+  termination on (the benchmark config) a replica whose lowest-id home got pruned can be skipped.
+  Measured overlap with the per-query path: 0.9985-1.0000.
+* The tests that cover FastScan, the asymmetric cascade and real-data polysemy need a corpus file,
+  so they don't run without one.
+* AVX2 only; Python binding only; save/load doesn't keep the polysemy and FastScan settings.
 
-## 7. Reproduce
+## 8. Reproduce
+
+The Linux comparison, from `bench/fair/README.md`:
 
 ```bash
-python bench/data/build_hotpot_corpus.py --out hotpot_5M.npy     # a GPU helps
-python bench/data/embed_hotpot_questions.py
-python tests/test_index.py
-python bench/build_hnsw_cache.py hotpot_5M.npy 1000000            # slow
-python bench/bench_vs_faiss.py hotpot_5M.npy --n 1000000 \
-    --questions bench/data/hotpot_questions_minilm.npy \
-    --systems ours-quality+poly+fs,ours-memory+poly+fs,hnsw \
-    --rfs 8,16,32 --probes 64,128,256,512,1024,2048,4096
-python bench/bench_scale_ours.py hotpot_5M.npy --n 2000000 --variant quality+poly+fs \
-    --questions bench/data/hotpot_questions_minilm.npy
-python bench/results_tables.py bench/results/*.json
+bash bench/fair/setup.sh
+python bench/fair/prep_data.py
+bash bench/fair/run_all.sh
+python bench/fair/summarise.py ~/maivs-fair/results
 ```
+
+The Windows runs: `bench/bench_vs_faiss.py` and `bench/bench_scale_ours.py`, as in
+[`bench/README.md`](../bench/README.md).
