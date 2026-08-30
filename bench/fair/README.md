@@ -29,6 +29,9 @@ on Linux, with every system built properly, in one harness.
 | faiss IVF-PQ FastScan | `IVF{nl},PQ192x4fs,RFlat`, nl 1024/2048 at 250k, 2048/4096 at 500k | nprobe 4-512 (up to nl/2) x k_factor 4, 16, 64 |
 | faiss IVF-RaBitQ FastScan | `IVF{nl},RaBitQfs,RFlat` (1 bit) and `RaBitQfs4` (4 bits) | same |
 
+For the memory-matched runs: ScaNN and ScaNN + SOAR with INT8 reorder, faiss `HNSW32,SQ8`, and
+faiss `IVF{nl},PQ192x4fs,Refine(SQ8)`.
+
 ## Rules
 
 The same as `bench/bench_vs_faiss.py`, for every system:
@@ -67,6 +70,29 @@ MAIVS and faiss-HNSW at 500k in fresh processes to measure run-to-run drift.
 
 `fairbench.py SYSTEM N` runs one system on its own if you want to look at a single result.
 
+## Edge experiments
+
+```bash
+bash bench/fair/run_edges.sh
+python bench/fair/edges_summary.py ~/maivs-fair/results > edges_tables.md
+```
+
+* **Same memory** (~600 B/vector, 500k): the compressed configurations above against MAIVS
+  `memory`.
+* **Churn** (`churn.py`): build on rows [0, 400k), then 10 rounds of deleting 10k random original
+  ids and inserting 10k new rows from [400k, 500k). Ground truth is recomputed over the final live
+  set. Measured on the churned index, after each system's own maintenance step (MAIVS `compact()`,
+  ScaNN `rebalance()`), and against a fresh build on the final set. faiss HNSW has no delete, so
+  it only reports the rebuild.
+* **Filtered search** (`filtered.py`): every vector gets a random tag in [0, 1000) and the filter
+  keeps tag < t, for 50%, 10%, 1% and 0.1%. Ground truth is the exact top-10 among the vectors that
+  pass. MAIVS filters inside the scan, faiss HNSW uses `IDSelectorBitmap`, ScaNN has no filter API
+  so it over-fetches and drops the rest, and brute force scans the matching subset.
+
+ScaNN + SOAR isn't in the churn results because ScaNN 1.4.2 crashes when a SOAR index is updated.
+`scann_soar_crash.py` reproduces it at small scale; see the notes in
+`results/linux/README.md`.
+
 ## Files
 
 | file | what |
@@ -76,3 +102,5 @@ MAIVS and faiss-HNSW at 500k in fresh processes to measure run-to-run drift.
 | `fairbench.py` | one system at one size, one process |
 | `run_all.sh` | every system at 250k and 500k, plus the drift repeat |
 | `summarise.py` | matched-recall tables |
+| `churn.py`, `filtered.py`, `run_edges.sh`, `edges_summary.py` | the edge experiments |
+| `scann_soar_crash.py` | small reproduction of the ScaNN SOAR update crash |

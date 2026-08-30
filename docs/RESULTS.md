@@ -2,10 +2,10 @@
 
 Two sets of measurements:
 
-1. **Linux** (sections 1-3): every system built properly (faiss with AVX2, ScaNN 1.4.2,
+1. **Linux** (sections 1-6): every system built properly (faiss with AVX2, ScaNN 1.4.2,
    hnswlib, USearch) and run in one harness, `bench/fair/`, on HotpotQA 250k and 500k. These are
    the main results. Raw output and conditions: [`results/linux/`](../results/linux/).
-2. **Windows** (section 4): HotpotQA 250k to 5.2M and MS MARCO 1M against faiss-HNSW,
+2. **Windows** (section 7): HotpotQA 250k to 5.2M and MS MARCO 1M against faiss-HNSW,
    in [`results/windows/`](../results/windows/). The faiss there turned out to be the generic
    build without AVX2. That barely changes HNSW, but the faiss IVF numbers from those runs were
    wrong and are left out here.
@@ -103,7 +103,64 @@ Against the best HNSW at 500k:
 So at 500k the lead over HNSW is roughly 2x from batching times 1.5-2.6x from the engine itself,
 and the batching share grows with N and with the recall target.
 
-## 4. Windows runs, 250k to 5.2M
+## 4. Same memory budget (~600 B/vector), 500k
+
+| system | B/vector | build | best R@10 IND / OOD | IND 0.95 | IND 0.98 | OOD 0.95 | OOD 0.98 | p50 us IND 0.95 / 0.98 |
+|---|---|---|---|---|---|---|---|---|
+| MAIVS `memory` (SQ8 rerank) | 609 | 4.0 s | 0.9897 / 0.9874 | 29,711 | 15,462 | 28,563 | 11,923 | 281 / 677 |
+| ScaNN + SOAR, INT8 reorder | 788 | 20.3-28.3 s | 0.9890 / 0.9879 | 38,705 | 14,860 | 27,556 | 12,624 | 231 / 604 |
+| ScaNN, INT8 reorder | 592 | 15.2-21.6 s | 0.9797 / 0.9759 | 24,889 | - | 17,628 | - | 390 / - |
+| faiss HNSW32, SQ8 | 656 | 92.6 s | 0.9914 / 0.9901 | 19,950 | 7,986 | 9,947 | 5,969 | 290 / 674 |
+| faiss IVF-PQ4fs + SQ8 refine | 513 | 46.8-85.6 s | 0.9835 / 0.9822 | 21,670 | 9,283 | 18,355 | 8,969 | 461 / 1,428 |
+
+Against the systems that fit the same budget, MAIVS `memory` is 1.2-2.9x faster (ScaNN INT8 never
+reaches 0.98). It's level with ScaNN + SOAR INT8, which needs 30% more memory, except at IND 0.95
+where ScaNN is 1.3x faster. Only HNSW SQ8 reaches 0.99 in this budget.
+
+## 5. Churn: 25% turnover of a 400k index
+
+Build on rows [0, 400k), then 10 rounds of deleting 10k random original ids and inserting 10k new
+rows. Ground truth over the final live set. Batch QPS at R@10 0.95 / 0.98:
+
+| system | build | deletes | inserts | maintenance | churned, OOD | after maintenance, OOD | fresh build, OOD |
+|---|---|---|---|---|---|---|---|
+| MAIVS `quality` | 4.8 s | 0.24 s (418k/s) | 1.41 s (71k/s) | `compact()` 0.39 s | 5,924 / - | 21,595 / 15,050 | 22,235 / 14,816 |
+| MAIVS `memory` | 4.3 s | 0.31 s | 1.03 s | `compact()` 0.14 s | 4,077 / - | 26,296 / 14,633 | 30,355 / 11,955 |
+| ScaNN (no SOAR) | 17.6 s | 0.48 s | 1.60 s | `rebalance()` (retrain) 19.1 s | 24,043 / - | 19,175 / - | 24,557 / - |
+| hnswlib HNSW32 | 125.9 s | 0.10 s (`mark_deleted`) | 427.4 s (`replace_deleted`) | none | 6,535 / 3,851 | | 6,765 / 3,923 |
+| faiss HNSW32 | | no delete | no delete | full rebuild 121.8 s | | | 6,052 / 3,349 |
+| ScaNN + SOAR | | crashes | crashes | | | | |
+
+* MAIVS takes the full 25% turnover, cleanup included, in about 2 s and ends at fresh-build
+  quality (best R@10 0.9993 / 0.9983 after `compact()`, the same as a fresh build). A complete
+  rebuild (3.8 s) is also cheaper than any other system's update path.
+* The cleanup is needed: before `compact()` it's 3.6-6.4x slower and its recall ceiling drops to
+  0.9856 IND / 0.9664 OOD. Nothing schedules `compact()` yet.
+* ScaNN without SOAR updates quickly without losing anything, but tops out around 0.98 in this
+  grid. ScaNN + SOAR crashes on update (ScaNN 1.4.2; reproduction in `bench/fair/`).
+* hnswlib's `replace_deleted` inserts took 3.6x longer than building from scratch, and faiss HNSW
+  can't delete.
+* Not tested: drift, where the new data doesn't fit the existing cells. MAIVS never retrains its
+  cells and fits the SQ8 range on the first batch.
+
+## 6. Filtered search, 500k
+
+Random tag per vector, filter keeps 50% / 10% / 1% / 0.1%. Batch QPS at R@10 0.95, IND:
+
+| system | 50% | 10% | 1% | 0.1% |
+|---|---|---|---|---|
+| MAIVS (filter inside the scan) | 14,154 | 12,659 | 8,334 | 2,943 |
+| faiss HNSW32 (`IDSelectorBitmap`) | 8,107 | 4,388 | 968 | best R@10 only 0.83 |
+| ScaNN + SOAR (over-fetch, then filter) | 30,075 | 14,970 | 3,771 | 448 |
+| brute force over the matching subset | 453 | 2,327 | 22,759 | 172,535 |
+
+MAIVS reaches R@10 >= 0.9987 at every selectivity and is the fastest index at <= 1% (at 1%,
+1.4-3.2x ScaNN and 7-12x HNSW across the recall targets), while faiss HNSW falls apart at 0.1%. But it isn't the best option anywhere:
+over-fetching ScaNN wins at 10-50%, and brute force over the matching subset wins at <= 1%. The
+"filters make it faster" result from July compared MAIVS with itself.
+All four selectivities, IND and OOD: [`results/linux/edges_tables.md`](../results/linux/edges_tables.md).
+
+## 7. Windows runs, 250k to 5.2M
 
 These are the runs in [`results/windows/`](../results/windows/) and
 [`RESULTS_tables.md`](RESULTS_tables.md). The faiss on that machine was the generic build without
@@ -135,7 +192,7 @@ real questions it stays roughly flat up to 1M. MS MARCO 1M looked the same (2.6-
 on Windows). At 5.23M the `memory` profile builds in 60 s at 601 B/vector and reaches IND 0.976 at
 4,787 QPS; HNSW wouldn't fit on the machine.
 
-## 5. Where the gains came from
+## 8. Where the gains came from
 
 From the development runs, HotpotQA 1M, same harness throughout (Windows; each row
 already has the engine fixes and cell-major batching):
@@ -172,7 +229,7 @@ a graph search is bound by memory latency, where compression just adds decode wo
 1-bit codes lose recall on their own, and the exact rerank, the independent second home and the
 FastScan estimator win it back.
 
-## 6. Scope
+## 9. Scope
 
 What the data supports, for 384-d MiniLM embeddings of text passages on one machine:
 
@@ -180,17 +237,20 @@ What the data supports, for 384-d MiniLM embeddings of text passages on one mach
   median latency at every matched recall from 0.95 to 0.995;
 * level with ScaNN + SOAR on held-out passages and 5-20% behind on real questions, with a 4-5x
   faster build and ~10% less memory; ScaNN has the lower single-query latency;
+* updates: 25% turnover absorbed in about 2 s including cleanup;
+* in a ~600 B/vector budget, the fastest or level with the fastest, up to R@10 ~0.99.
 
 What it doesn't support:
 
 * anything about other datasets (SIFT, GIST, GloVe, Deep), dimensions or embedding models;
 * anything above 500k on Linux, or above 5.2M at all;
-* anything about updates or filtered search against these baselines (not run yet);
-* a comparison with Quake, SPFresh or DiskANN.
+* a comparison with Quake, SPFresh or DiskANN, which matters most for the update results;
+* filtered search being a strength (it holds up, but it's never the fastest).
 
-## 7. Known gaps
+## 10. Known gaps
 
-* `compact()` isn't scheduled automatically.
+* `compact()` isn't scheduled automatically, and until it runs a churned index is several times
+  slower.
 * In cell-major mode the exactly-once bitset is built before adaptive pruning, so with early
   termination on (the benchmark config) a replica whose lowest-id home got pruned can be skipped.
   Measured overlap with the per-query path: 0.9985-1.0000.
@@ -198,15 +258,16 @@ What it doesn't support:
   so they don't run without one.
 * AVX2 only; Python binding only; save/load doesn't keep the polysemy and FastScan settings.
 
-## 8. Reproduce
+## 11. Reproduce
 
 The Linux comparison, from `bench/fair/README.md`:
 
 ```bash
 bash bench/fair/setup.sh
 python bench/fair/prep_data.py
-bash bench/fair/run_all.sh
+bash bench/fair/run_all.sh && bash bench/fair/run_edges.sh
 python bench/fair/summarise.py ~/maivs-fair/results
+python bench/fair/edges_summary.py ~/maivs-fair/results
 ```
 
 The Windows runs: `bench/bench_vs_faiss.py` and `bench/bench_scale_ours.py`, as in
