@@ -8,7 +8,9 @@ hnswlib and USearch in one harness, at 500k vectors:
 * about 3x the batch throughput of HNSW at matched recall (2.6-3.9x from R@10 0.95 to 0.995),
   1.5-2.6x even without batching, with lower median latency and a build about 30x faster;
 * level with Google's ScaNN + SOAR on held-out passages and 5-20% behind it on real questions,
-  with a 4-5x faster build and ~10% less memory; ScaNN has the lower single-query latency.
+  with a 4-5x faster build and ~10% less memory; ScaNN has the lower single-query latency;
+* 25% of a 400k index replaced (100k deletes and 100k inserts) in about 2 s, cleanup included,
+  ending at fresh-build quality.
 
 ```text
 fixed 128-vector cells over one flat arena
@@ -36,15 +38,28 @@ matched R@10:
 | hnswlib HNSW32 | 11,472 | 3,302 | 1,589 | 6,152 | 2,797 | 1,981 | 148 s | 1,812 |
 | faiss HNSW32 | 10,101 | 3,427 | 2,268 | 6,697 | 2,602 | 1,667 | 153 s | 1,808 |
 
-"-" = not reached in that system's grid. Latency, 250k and everything else: [`docs/RESULTS.md`](docs/RESULTS.md). Raw output:
+"-" = not reached in that system's grid. Latency, 250k, the memory-matched and filtered runs and
+everything else: [`docs/RESULTS.md`](docs/RESULTS.md). Raw output:
 [`results/linux/`](results/linux/). Harness: [`bench/fair/`](bench/fair/).
+
+Updates (25% turnover of a 400k index, 10 rounds):
+
+| system | delete + insert | cleanup | result |
+|---|---|---|---|
+| MAIVS `quality` | 0.24 s + 1.41 s | `compact()` 0.39 s | same recall and speed as a fresh build |
+| ScaNN (no SOAR) | 0.48 s + 1.60 s | `rebalance()` 19.1 s | fine, recall ceiling ~0.98 in this grid |
+| ScaNN + SOAR | crashes (ScaNN 1.4.2) | | reproduced in `bench/fair/scann_soar_crash.py` |
+| hnswlib | 0.10 s + 427 s | | inserts into deleted slots took longer than a rebuild |
+| faiss HNSW | no delete | rebuild 122 s | |
 
 What these numbers don't show:
 
 * One corpus, one embedding model, one laptop, up to 500k on Linux. No SIFT/GIST/GloVe/Deep, no
   other dimensions, nothing past 5.2M.
-* No comparison yet with Quake, SPFresh or DiskANN, and updates and filtered search haven't been
-  re-run against these baselines.
+* No comparison yet with Quake, SPFresh or DiskANN, which matters most for the update numbers.
+* Filtered search holds up (R@10 >= 0.9987 down to 0.1% selectivity, where faiss HNSW falls to
+  0.83) but never the fastest option: over-fetching ScaNN wins at 10-50%, brute force over the
+  matching subset at <= 1%.
 * The batch numbers use cell-major execution with 1,000-query batches; at 500k batching is worth
   about 2x.
 
@@ -78,7 +93,8 @@ theory and the negative results, is in [`docs/RESEARCH_LOG.md`](docs/RESEARCH_LO
 
 The pieces are known: the polysemy assignment loss is SOAR's (Sun, Guo & Kumar, NeurIPS 2023),
 the 1-bit codes follow RaBitQ (Gao & Long, SIGMOD 2024), and the FastScan layout is from Andre et
-al. (VLDB 2015). What this repository adds is a direct measurement of why orthogonal homes miss independently while
+al. (VLDB 2015). Quake (OSDI 2025) and SPFresh (SOSP 2023) are the closest work on updates. What
+this repository adds is a direct measurement of why orthogonal homes miss independently while
 next-nearest or independently trained homes don't, exactly-once scoring over contiguous replica
 runs, a cell-major join, and an end-to-end comparison in one harness. See
 [`docs/REFERENCES.md`](docs/REFERENCES.md).
@@ -132,6 +148,7 @@ The Linux comparison is in [`bench/fair/`](bench/fair/README.md):
 bash bench/fair/setup.sh
 python bench/fair/prep_data.py
 bash bench/fair/run_all.sh
+bash bench/fair/run_edges.sh
 ```
 
 The corpus builders and the earlier single-machine harness are described in
@@ -140,8 +157,8 @@ The corpus builders and the earlier single-machine harness are described in
 ## Known limitations
 
 * AVX2 kernels only, no ARM/NEON. Python binding only: no server, write-ahead log or sharding.
-* After `compact()`, the first mutation drops back to the slower plain Hamming path until the
-  next `compact()`, and nothing schedules compaction.
+* `compact()` has to be called after heavy churn and nothing schedules it; until it runs, a
+  churned index is several times slower.
 * In cell-major mode with early termination on, a replica whose lowest-id home was pruned can be
   skipped (overlap with the per-query path 0.9985-1.0000).
 * Deletes leave the two-stage routing codes stale until the next refresh.

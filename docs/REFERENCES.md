@@ -7,21 +7,26 @@ What the engine builds on, and how each part relates to published work.
 | part | prior work | relation |
 |---|---|---|
 | partitioned index with probe + rerank | IVF-ADC [1]; faiss [2, 3] | same family. Differences: fixed 128-vector cells instead of sqrt(N) lists, a centroid tree for routing, one flat arena |
-| randomised Hadamard rotation + sign codes | fast JL transform [4]; sign random projections [5]; RaBitQ [6] | RaBitQ's rotation and 1-bit codes, with an exact rerank instead of RaBitQ's unbiased estimator |
+| randomised Hadamard rotation + sign codes | fast JL transform [4]; sign random projections [5]; RaBitQ [6]; Extended RaBitQ [32] | RaBitQ's rotation and 1-bit codes, with an exact rerank instead of RaBitQ's unbiased estimator; multi-bit codes (Extended RaBitQ) not tried |
 | FastScan first stage | PQ FastScan [7, 8]; RaBitQ's batch estimator [6] | FastScan lookup tables on 1-bit codes read as 4-bit groups, as in [6] |
 | orthogonal polysemy | SOAR [9]; spill trees [10] | the assignment loss is SOAR's: `norm(r')^2 + lam*(r'.r_hat)^2`. What I add: a direct measurement that the two homes' misses are independent ([`RESEARCH_LOG.md`](RESEARCH_LOG.md) section 4.2), and exactly-once scoring with contiguous replica runs in both per-query and cell-major execution |
 | cell-major batch execution | batched inverted-list scanning in IVF systems [3] | same idea (read each list once for every query that probes it). What's specific here: per-query seeding and a shared atomic cut-off, which keep the results identical to the per-query path |
 | integer bucket-queue top-k | standard radix / bucket selection | |
+| updates: O(1) delete, `compact()`, no retraining | SPANN [23], SPFresh [24], Quake [25], DeDrift [26] | the same problem as Quake and SPFresh (keeping a partitioned index good under inserts and deletes), done much more simply: no cost model, no adaptive split/merge in the benchmarked path. Compared so far only against HNSW and ScaNN; Quake and SPFresh are the comparisons that matter |
+| per-query recall and probing | DARTH [27]; Quake's adaptive probing [25] | MAIVS uses a fixed nprobe with a reachability-bound early stop; no recall target |
+| the routing studies in `history/` | graph-partitioned routing [33] | the closest published account of the routing failure studied in `history/SCALABILITY_PLAN.md`; their shards are ~10^7 points, these cells are 128 |
 | attractor tree (where the project started) | Hopfield networks [11, 12] | the prototype routed through a recursive Hopfield tree; the engine kept the hierarchy and replaced the attractor dynamics with a flat SIMD scan per level |
 
 ## Baselines measured
 
-* faiss `IndexHNSWFlat` (HNSW [13]), faiss IVF-RaBitQ and IVF-PQ FastScan [2], all faiss-cpu
-  1.14.3.
-* USearch 2.26.4 [14], a separate HNSW implementation.
+* Linux (`bench/fair/`): faiss-cpu 1.15.1 with AVX2 [2] (`IndexHNSWFlat` [13], HNSW SQ8,
+  IVF-PQ FastScan, IVF-RaBitQ FastScan 1- and 4-bit), hnswlib 0.8.0 [28], USearch 2.26.5 [14], and
+  ScaNN 1.4.2 [15] with and without SOAR [9].
+* Windows (`results/windows/`): faiss-cpu 1.14.3, which turned out to be the generic
+  build without AVX2 (see [`RESULTS.md`](RESULTS.md) section 7), and USearch 2.26.4.
 
-Not measured yet, and needed before claiming anything about the state of the art: ScaNN [15],
-DiskANN [16], and the ann-benchmarks suite [17].
+Not measured yet: Quake [25], SPFresh [24], DiskANN [16], SVS [29], RAIRS [30], and the
+ann-benchmarks suite [17] and Big-ANN streaming runbooks [31].
 
 ## Data
 
@@ -83,3 +88,21 @@ DiskANN [16], and the ann-benchmarks suite [17].
 22. W. Wang, F. Wei, L. Dong, H. Bao, N. Yang, M. Zhou. *MiniLM: Deep
     Self-Attention Distillation for Task-Agnostic Compression of Pre-Trained
     Transformers.* NeurIPS 2020.
+23. Q. Chen et al. *SPANN: Highly-efficient Billion-scale Approximate Nearest Neighbor Search.*
+    NeurIPS 2021.
+24. Y. Xu et al. *SPFresh: Incremental In-Place Update for Billion-Scale Vector Search.* SOSP 2023.
+25. J. Mohoney et al. *Quake: Adaptive Indexing for Vector Search.* OSDI 2025.
+26. D. Baranchuk, M. Douze, Y. Upadhyay, I. Z. Yalniz. *DeDrift: Robust Similarity Search under
+    Content Drift.* ICCV 2023.
+27. *DARTH: Declarative Recall Through Early Termination for Approximate Nearest Neighbor
+    Search.* SIGMOD 2026.
+28. Y. Malkov et al. *hnswlib.* https://github.com/nmslib/hnswlib
+29. C. Aguerrebere, I. S. Bhati, M. Hildebrand, M. Tepper, T. Willke. *Similarity search in the
+    blink of an eye with compressed indices.* PVLDB 16(11), 2023.
+30. *RAIRS: Optimizing Redundant Assignment and List Layout for IVF-Based ANN Search.*
+    arXiv:2601.07183, 2026.
+31. H. V. Simhadri et al. *Results of the Big ANN: NeurIPS'23.* arXiv:2409.17424, 2024.
+32. J. Gao et al. *Practical and Asymptotically Optimal Quantization of High-Dimensional Vectors
+    in Euclidean Space for Approximate Nearest Neighbor Search* (Extended RaBitQ). SIGMOD 2025.
+33. L. Gottesbueren, L. Dhulipala, R. Jayaram, J. Lacki. *Unleashing Graph Partitioning for
+    Large-Scale Nearest Neighbor Search.* PVLDB 18(6), 2025.
